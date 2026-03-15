@@ -1,0 +1,2 @@
+pybit>=5.8.0
+psycopg2-binary>=2.9.0
