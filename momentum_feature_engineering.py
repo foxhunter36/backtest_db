@@ -21,7 +21,7 @@ import pandas as pd
 import numpy as np
 import time
 
-PG_DSN = "host=192.168.0.165 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
 
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "TRUMPUSDT", "XRPUSDT", "HYPEUSDT",
