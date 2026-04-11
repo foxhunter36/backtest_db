@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+SOL Supertrend — Trailing Stop Parameter Scan
+══════════════════════════════════════════════
+Testet Trailing Stop vs. fixer TP vs. ST-Flip-Only.
+
+Trailing Stop Logik (wie live):
+  1. Entry mit SL (fix)
+  2. Kein fixer TP
+  3. Wenn PnL >= TRAIL_ACTIVATION_PCT: Trailing Stop aktivieren
+  4. Trail Offset = TRAIL_ATR_MULT × ATR
+  5. Exit wenn: SL hit, Trail hit, oder ST-Flip
+
+Läuft auf Trading Station, DB via Tailscale.
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+from itertools import product
+
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+SYMBOL = "SOLUSDT"
+
+# Fixed params (aus vorherigem Scan bestätigt)
+ST_ATR_PERIOD = 14
+ST_MULTIPLIER = 2.0
+AO_FAST = 7
+AO_SLOW = 34
+FEE_PCT = 0.055
+FUNDING_LONG_MAX = 0.0001
+FUNDING_SHORT_MIN = -0.0001
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDICATORS
+# ═══════════════════════════════════════════════════════════════════════
+
+def calc_atr(df, period=ST_ATR_PERIOD):
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+
+def calc_supertrend(df):
+    df = df.copy()
+    atr = calc_atr(df)
+    df["atr"] = atr
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper = (hl2 + ST_MULTIPLIER * atr).values
+    lower = (hl2 - ST_MULTIPLIER * atr).values
+    close = df["close"].values
+    n = len(df)
+
+    fu = np.full(n, np.nan)
+    fl = np.full(n, np.nan)
+    d = np.zeros(n, dtype=int)
+    s = ST_ATR_PERIOD
+
+    if s >= n:
+        df["st_direction"] = 0; df["st_long"] = False; df["st_short"] = False
+        return df
+
+    fu[s] = upper[s]; fl[s] = lower[s]; d[s] = -1
+    for i in range(s + 1, n):
+        fu[i] = upper[i] if (upper[i] < fu[i-1] or close[i-1] > fu[i-1]) else fu[i-1]
+        fl[i] = lower[i] if (lower[i] > fl[i-1] or close[i-1] < fl[i-1]) else fl[i-1]
+        if d[i-1] == 1:
+            if close[i] < fl[i]: d[i] = -1
+            else: d[i] = 1
+        else:
+            if close[i] > fu[i]: d[i] = 1
+            else: d[i] = -1
+
+    df["st_direction"] = d
+    ds = pd.Series(d, index=df.index)
+    df["st_long"] = (ds == 1) & (ds.shift(1) == -1)
+    df["st_short"] = (ds == -1) & (ds.shift(1) == 1)
+    return df
+
+
+def calc_ao(df):
+    df = df.copy()
+    mid = (df["high"] + df["low"]) / 2.0
+    df["ao"] = mid.rolling(AO_FAST).mean() - mid.rolling(AO_SLOW).mean()
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BACKTEST ENGINE MIT TRAILING STOP
+# ═══════════════════════════════════════════════════════════════════════
+
+def backtest_trailing(df, sl_mult, trail_activation_pct, trail_atr_mult):
+    """
+    Trailing Stop Backtest.
+    - Entry: Market bei ST-Flip + AO + FR
+    - SL: sl_mult × ATR (fix)
+    - Kein fixer TP
+    - Bei PnL >= trail_activation_pct: Trailing Stop mit trail_atr_mult × ATR
+    - Exit: SL, Trail, oder ST-Flip
+    """
+    trades = []
+    pos = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        c, h, l = row["close"], row["high"], row["low"]
+
+        if pos:
+            # Aktuellen PnL berechnen
+            if pos["side"] == "long":
+                current_pnl_pct = (c - pos["entry"]) / pos["entry"] * 100
+            else:
+                current_pnl_pct = (pos["entry"] - c) / pos["entry"] * 100
+
+            # Trail aktivieren wenn noch nicht aktiv
+            if not pos["trail_active"] and current_pnl_pct >= trail_activation_pct:
+                trail_offset = row["atr"] * trail_atr_mult
+                if pos["side"] == "long":
+                    pos["trail_price"] = c - trail_offset
+                else:
+                    pos["trail_price"] = c + trail_offset
+                pos["trail_active"] = True
+                pos["trail_offset"] = trail_offset
+
+            # Trail nachziehen (nur in Gewinnrichtung)
+            if pos["trail_active"]:
+                if pos["side"] == "long":
+                    new_trail = h - pos["trail_offset"]
+                    if new_trail > pos["trail_price"]:
+                        pos["trail_price"] = new_trail
+                else:
+                    new_trail = l + pos["trail_offset"]
+                    if new_trail < pos["trail_price"]:
+                        pos["trail_price"] = new_trail
+
+            # Exit checks
+            exited = False
+
+            if pos["side"] == "long":
+                # SL check
+                if l <= pos["sl"]:
+                    pnl = (pos["sl"] - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "SL", "bars": i - pos["bar"],
+                                   "trail_was_active": pos["trail_active"]})
+                    exited = True
+                # Trail check
+                elif pos["trail_active"] and l <= pos["trail_price"]:
+                    pnl = (pos["trail_price"] - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "TRAIL", "bars": i - pos["bar"],
+                                   "trail_was_active": True})
+                    exited = True
+                # ST Flip
+                elif row["st_short"]:
+                    pnl = (c - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "FLIP", "bars": i - pos["bar"],
+                                   "trail_was_active": pos["trail_active"]})
+                    exited = True
+            else:
+                if h >= pos["sl"]:
+                    pnl = (pos["entry"] - pos["sl"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "SL", "bars": i - pos["bar"],
+                                   "trail_was_active": pos["trail_active"]})
+                    exited = True
+                elif pos["trail_active"] and h >= pos["trail_price"]:
+                    pnl = (pos["entry"] - pos["trail_price"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "TRAIL", "bars": i - pos["bar"],
+                                   "trail_was_active": True})
+                    exited = True
+                elif row["st_long"]:
+                    pnl = (pos["entry"] - c) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "FLIP", "bars": i - pos["bar"],
+                                   "trail_was_active": pos["trail_active"]})
+                    exited = True
+
+            if exited:
+                pos = None
+            else:
+                continue
+
+        if pos:
+            continue
+
+        # Signal
+        sig = None
+        if row["st_long"]: sig = "long"
+        elif row["st_short"]: sig = "short"
+        if not sig: continue
+
+        # AO filter
+        if sig == "long" and row["ao"] <= 0: continue
+        if sig == "short" and row["ao"] >= 0: continue
+
+        # FR filter
+        fr = row.get("funding_rate", np.nan)
+        if pd.notna(fr):
+            if sig == "long" and fr > FUNDING_LONG_MAX: continue
+            if sig == "short" and fr < FUNDING_SHORT_MIN: continue
+
+        atr = row["atr"]
+        if atr <= 0: continue
+
+        if sig == "long":
+            pos = {"side": "long", "entry": c, "sl": c - sl_mult * atr,
+                   "bar": i, "trail_active": False, "trail_price": 0, "trail_offset": 0}
+        else:
+            pos = {"side": "short", "entry": c, "sl": c + sl_mult * atr,
+                   "bar": i, "trail_active": False, "trail_price": 0, "trail_offset": 0}
+
+    # Close open at end
+    if pos:
+        c = df.iloc[-1]["close"]
+        if pos["side"] == "long":
+            pnl = (c - pos["entry"]) / pos["entry"] * 100
+        else:
+            pnl = (pos["entry"] - c) / pos["entry"] * 100
+        trades.append({"pnl": pnl, "exit": "END", "bars": len(df) - pos["bar"],
+                       "trail_was_active": pos["trail_active"]})
+
+    return analyze(trades)
+
+
+def backtest_fixed_tp(df, sl_mult, tp_mult):
+    """Fixer TP zum Vergleich."""
+    trades = []
+    pos = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        c, h, l = row["close"], row["high"], row["low"]
+
+        if pos:
+            if pos["side"] == "long":
+                if l <= pos["sl"]:
+                    trades.append({"pnl": (pos["sl"]-pos["entry"])/pos["entry"]*100, "exit":"SL", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+                elif h >= pos["tp"]:
+                    trades.append({"pnl": (pos["tp"]-pos["entry"])/pos["entry"]*100, "exit":"TP", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+                elif row["st_short"]:
+                    trades.append({"pnl": (c-pos["entry"])/pos["entry"]*100, "exit":"FLIP", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+            else:
+                if h >= pos["sl"]:
+                    trades.append({"pnl": (pos["entry"]-pos["sl"])/pos["entry"]*100, "exit":"SL", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+                elif l <= pos["tp"]:
+                    trades.append({"pnl": (pos["entry"]-pos["tp"])/pos["entry"]*100, "exit":"TP", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+                elif row["st_long"]:
+                    trades.append({"pnl": (pos["entry"]-c)/pos["entry"]*100, "exit":"FLIP", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+
+        if pos: continue
+
+        sig = None
+        if row["st_long"]: sig = "long"
+        elif row["st_short"]: sig = "short"
+        if not sig: continue
+        if sig == "long" and row["ao"] <= 0: continue
+        if sig == "short" and row["ao"] >= 0: continue
+        fr = row.get("funding_rate", np.nan)
+        if pd.notna(fr):
+            if sig == "long" and fr > FUNDING_LONG_MAX: continue
+            if sig == "short" and fr < FUNDING_SHORT_MIN: continue
+        atr = row["atr"]
+        if atr <= 0: continue
+
+        if sig == "long":
+            pos = {"side":"long","entry":c,"sl":c-sl_mult*atr,"tp":c+tp_mult*atr,"bar":i}
+        else:
+            pos = {"side":"short","entry":c,"sl":c+sl_mult*atr,"tp":c-tp_mult*atr,"bar":i}
+
+    return analyze(trades)
+
+
+def backtest_flip_only(df, sl_mult):
+    """Nur SL + ST-Flip, kein TP, kein Trail."""
+    trades = []
+    pos = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        c, h, l = row["close"], row["high"], row["low"]
+
+        if pos:
+            if pos["side"] == "long":
+                if l <= pos["sl"]:
+                    trades.append({"pnl": (pos["sl"]-pos["entry"])/pos["entry"]*100, "exit":"SL", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+                elif row["st_short"]:
+                    trades.append({"pnl": (c-pos["entry"])/pos["entry"]*100, "exit":"FLIP", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+            else:
+                if h >= pos["sl"]:
+                    trades.append({"pnl": (pos["entry"]-pos["sl"])/pos["entry"]*100, "exit":"SL", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+                elif row["st_long"]:
+                    trades.append({"pnl": (pos["entry"]-c)/pos["entry"]*100, "exit":"FLIP", "bars":i-pos["bar"], "trail_was_active":False})
+                    pos = None
+
+        if pos: continue
+        sig = None
+        if row["st_long"]: sig = "long"
+        elif row["st_short"]: sig = "short"
+        if not sig: continue
+        if sig == "long" and row["ao"] <= 0: continue
+        if sig == "short" and row["ao"] >= 0: continue
+        fr = row.get("funding_rate", np.nan)
+        if pd.notna(fr):
+            if sig == "long" and fr > FUNDING_LONG_MAX: continue
+            if sig == "short" and fr < FUNDING_SHORT_MIN: continue
+        atr = row["atr"]
+        if atr <= 0: continue
+
+        if sig == "long":
+            pos = {"side":"long","entry":c,"sl":c-sl_mult*atr,"bar":i}
+        else:
+            pos = {"side":"short","entry":c,"sl":c+sl_mult*atr,"bar":i}
+
+    return analyze(trades)
+
+
+def analyze(trades):
+    if not trades:
+        return None
+
+    pnls = np.array([t["pnl"] - FEE_PCT * 2 for t in trades])
+    bars = np.array([t["bars"] for t in trades])
+    wins = (pnls > 0).sum()
+    total = len(pnls)
+    cum = np.cumsum(pnls)
+    max_dd = (cum - np.maximum.accumulate(cum)).min()
+    sharpe = pnls.mean() / pnls.std() * np.sqrt(total) if pnls.std() > 0 else 0
+    gp = pnls[pnls > 0].sum()
+    gl = abs(pnls[pnls <= 0].sum())
+    pf = gp / gl if gl > 0 else float("inf")
+
+    exits = {}
+    trail_count = 0
+    for t in trades:
+        exits[t["exit"]] = exits.get(t["exit"], 0) + 1
+        if t.get("trail_was_active"):
+            trail_count += 1
+
+    return {
+        "trades": total, "wins": wins, "winrate": wins / total * 100,
+        "total_pnl": pnls.sum(), "avg_pnl": pnls.mean(),
+        "max_dd": max_dd, "sharpe": sharpe, "pf": pf,
+        "avg_bars": bars.mean(), "exits": exits,
+        "trail_activated": trail_count,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 95)
+    print("SOL SUPERTREND — TRAILING STOP PARAMETER SCAN")
+    print(f"ST: ATR({ST_ATR_PERIOD}) × {ST_MULTIPLIER} | AO: {AO_FAST}/{AO_SLOW} | FR: ±{FUNDING_LONG_MAX}")
+    print("=" * 95)
+
+    # Load data
+    conn = psycopg2.connect(PG_DSN)
+    raw = pd.read_sql_query(
+        "SELECT timestamp, open, high, low, close, volume FROM kline_1h "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(SYMBOL,))
+    fr = pd.read_sql_query(
+        "SELECT timestamp, funding_rate FROM funding_rate "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(SYMBOL,))
+    conn.close()
+
+    if len(fr) > 0:
+        raw = pd.merge_asof(raw.sort_values("timestamp"), fr.sort_values("timestamp"),
+                            on="timestamp", direction="backward")
+    else:
+        raw["funding_rate"] = np.nan
+
+    df = calc_supertrend(raw)
+    df = calc_ao(df)
+    df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+    print(f"Data: {len(df)} bars ({len(df)/24:.0f} Tage)\n")
+
+    # ══════════════════════════════════════════════════════════════
+    #  TEIL 1: TRAILING STOP GRID
+    # ══════════════════════════════════════════════════════════════
+    print("=" * 95)
+    print("TEIL 1: TRAILING STOP PARAMETER GRID")
+    print("=" * 95)
+
+    sl_values = [1.5, 2.0, 2.5, 3.0]
+    trail_activations = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0]
+    trail_offsets = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+    results = []
+    total_combos = len(sl_values) * len(trail_activations) * len(trail_offsets)
+    done = 0
+
+    for sl, act, off in product(sl_values, trail_activations, trail_offsets):
+        done += 1
+        r = backtest_trailing(df, sl_mult=sl, trail_activation_pct=act, trail_atr_mult=off)
+        if r:
+            r["sl"] = sl; r["trail_act"] = act; r["trail_off"] = off
+            results.append(r)
+
+        if done % 50 == 0:
+            print(f"  Progress: {done}/{total_combos}")
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'SL':>4s} {'Act%':>5s} {'Off':>4s} | {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'MaxDD':>7s} {'AvgBars':>8s} {'Trails':>7s}")
+    print("-" * 85)
+    for r in results[:25]:
+        marker = " <-- LIVE" if r["sl"] == 2.0 and r["trail_act"] == 4.0 and r["trail_off"] == 2.5 else ""
+        marker = " <-- BEST" if r == results[0] else marker
+        print(f"{r['sl']:>4.1f} {r['trail_act']:>5.1f} {r['trail_off']:>4.1f} | "
+              f"{r['trades']:>6d} {r['winrate']:>4.0f}% {r['total_pnl']:>+7.1f}% "
+              f"{r['sharpe']:>7.2f} {r['pf']:>5.2f} {r['max_dd']:>6.1f}% "
+              f"{r['avg_bars']:>7.1f} {r['trail_activated']:>6d}{marker}")
+
+    best_trail = results[0]
+
+    # ══════════════════════════════════════════════════════════════
+    #  TEIL 2: VERGLEICH EXIT-STRATEGIEN
+    # ══════════════════════════════════════════════════════════════
+    print("\n" + "=" * 95)
+    print("TEIL 2: EXIT-STRATEGIE VERGLEICH")
+    print("=" * 95)
+
+    comparisons = [
+        ("Trail BEST", "trail", best_trail["sl"], best_trail["trail_act"], best_trail["trail_off"]),
+        ("Trail LIVE (2.0/4%/2.5x)", "trail", 2.0, 4.0, 2.5),
+        ("Fixed TP 3×ATR (prev live)", "fixed", 2.0, 3.0, 0),
+        ("Fixed TP 4×ATR", "fixed", 2.0, 4.0, 0),
+        ("Fixed TP 5×ATR", "fixed", 2.0, 5.0, 0),
+        ("Fixed TP 6×ATR", "fixed", 2.0, 6.0, 0),
+        ("Flip Only (kein TP/Trail)", "flip", 2.0, 0, 0),
+        ("Flip Only SL 3×ATR", "flip", 3.0, 0, 0),
+    ]
+
+    print(f"\n{'Strategy':<30s} | {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'MaxDD':>7s} {'AvgBars':>8s} {'Exits'}")
+    print("-" * 110)
+
+    for name, mode, sl, param1, param2 in comparisons:
+        if mode == "trail":
+            r = backtest_trailing(df, sl_mult=sl, trail_activation_pct=param1, trail_atr_mult=param2)
+        elif mode == "fixed":
+            r = backtest_fixed_tp(df, sl_mult=sl, tp_mult=param1)
+        else:
+            r = backtest_flip_only(df, sl_mult=sl)
+
+        if r:
+            exit_str = " ".join(f"{k}:{v}" for k, v in sorted(r["exits"].items()))
+            print(f"{name:<30s} | {r['trades']:>6d} {r['winrate']:>4.0f}% {r['total_pnl']:>+7.1f}% "
+                  f"{r['sharpe']:>7.2f} {r['pf']:>5.2f} {r['max_dd']:>6.1f}% "
+                  f"{r['avg_bars']:>7.1f}  {exit_str}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  TEIL 3: WALK-FORWARD VALIDATION
+    # ══════════════════════════════════════════════════════════════
+    print("\n" + "=" * 95)
+    print("TEIL 3: WALK-FORWARD (70/30) — TRAILING STOP")
+    print("=" * 95)
+
+    split = int(len(df) * 0.7)
+    train = df.iloc[:split].reset_index(drop=True)
+    test = df.iloc[split:].reset_index(drop=True)
+    print(f"  Train: {len(train)/24:.0f} Tage | Test: {len(test)/24:.0f} Tage\n")
+
+    configs = [
+        ("BEST optimiert", best_trail["sl"], best_trail["trail_act"], best_trail["trail_off"]),
+        ("LIVE (2.0/4%/2.5x)", 2.0, 4.0, 2.5),
+        ("Konservativ (2.0/3%/2.0x)", 2.0, 3.0, 2.0),
+    ]
+
+    print(f"{'Config':<30s} | {'Set':<6s} | {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'MaxDD':>7s}")
+    print("-" * 85)
+
+    for name, sl, act, off in configs:
+        r_train = backtest_trailing(train, sl_mult=sl, trail_activation_pct=act, trail_atr_mult=off)
+        r_test = backtest_trailing(test, sl_mult=sl, trail_activation_pct=act, trail_atr_mult=off)
+
+        for label, r in [("Train", r_train), ("Test", r_test)]:
+            if r:
+                print(f"{name:<30s} | {label:<6s} | {r['trades']:>6d} {r['winrate']:>4.0f}% "
+                      f"{r['total_pnl']:>+7.1f}% {r['sharpe']:>7.2f} {r['pf']:>5.2f} "
+                      f"{r['max_dd']:>6.1f}%")
+            else:
+                print(f"{name:<30s} | {label:<6s} | (keine Trades)")
+
+    # ══════════════════════════════════════════════════════════════
+    #  ZUSAMMENFASSUNG
+    # ══════════════════════════════════════════════════════════════
+    print("\n" + "=" * 95)
+    print("ZUSAMMENFASSUNG")
+    print("=" * 95)
+    print(f"\n  Bester Trailing Stop:")
+    print(f"    SL:              {best_trail['sl']} × ATR")
+    print(f"    Trail Activation: {best_trail['trail_act']}%")
+    print(f"    Trail Offset:     {best_trail['trail_off']} × ATR")
+    print(f"    Sharpe:           {best_trail['sharpe']:.2f}")
+    print(f"    PnL:              {best_trail['total_pnl']:+.1f}%")
+    print(f"    MaxDD:            {best_trail['max_dd']:.1f}%")
+    print(f"    Trades:           {best_trail['trades']}")
+    print(f"\n  vs. Live:")
+    print(f"    SL: 2.0×ATR | Trail: +4%/2.5×ATR")
+
+
+if __name__ == "__main__":
+    main()

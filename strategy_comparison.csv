@@ -1,0 +1,13 @@
+strategy,filter,capital,trades,win_rate,pf,liquidated
+conservative,t=0.3,151.69,51,88.2,2.69,False
+conservative,t=0.4,169.29,44,93.2,3.44,False
+conservative,t=0.5,170.79,29,96.6,3.77,False
+conservative,t=0.6,125.34,15,93.3,1.91,False
+conservative,t=0.7,100.0,0,0.0,0.0,False
+conservative,none,151.69,51,88.2,2.69,False
+aggressive,t=0.3,146.19,502,73.5,2.45,False
+aggressive,t=0.4,78.38,463,73.4,2.39,False
+aggressive,t=0.5,103.84,370,73.2,2.29,False
+aggressive,t=0.6,117.94,229,75.5,2.0,False
+aggressive,t=0.7,123.92,89,77.5,2.34,False
+aggressive,none,135.25,507,73.0,2.39,False

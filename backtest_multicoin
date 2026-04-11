@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""
+Multi-Coin Supertrend Backtest — AO vs AO+FR Vergleich
+═══════════════════════════════════════════════════════
+Testet alle Coins mit >= 365 Tagen 1h-Daten.
+Vergleicht AO only vs AO+FR für jeden Coin.
+
+Läuft auf Trading Station, DB via Tailscale.
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+MIN_DAYS = 365
+
+ST_ATR_PERIOD = 14
+ST_MULTIPLIER = 2.0
+AO_FAST = 7
+AO_SLOW = 34
+SL_ATR_MULT = 2.0
+TP_ATR_MULT = 3.0
+FEE_PCT = 0.055
+FUNDING_LONG_MAX = 0.0001
+FUNDING_SHORT_MIN = -0.0001
+
+
+def calc_atr(df, period=ST_ATR_PERIOD):
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+
+def calc_supertrend(df):
+    df = df.copy()
+    atr = calc_atr(df)
+    df["atr"] = atr
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper = (hl2 + ST_MULTIPLIER * atr).values
+    lower = (hl2 - ST_MULTIPLIER * atr).values
+    close = df["close"].values
+    n = len(df)
+
+    fu = np.full(n, np.nan)
+    fl = np.full(n, np.nan)
+    st = np.full(n, np.nan)
+    d = np.zeros(n, dtype=int)
+
+    s = ST_ATR_PERIOD
+    if s >= n:
+        df["st_direction"] = 0
+        df["st_long"] = False
+        df["st_short"] = False
+        return df
+
+    fu[s] = upper[s]; fl[s] = lower[s]; st[s] = upper[s]; d[s] = -1
+
+    for i in range(s + 1, n):
+        fu[i] = upper[i] if (upper[i] < fu[i - 1] or close[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = lower[i] if (lower[i] > fl[i - 1] or close[i - 1] < fl[i - 1]) else fl[i - 1]
+
+        if d[i - 1] == 1:
+            if close[i] < fl[i]:
+                d[i] = -1; st[i] = fu[i]
+            else:
+                d[i] = 1; st[i] = fl[i]
+        else:
+            if close[i] > fu[i]:
+                d[i] = 1; st[i] = fl[i]
+            else:
+                d[i] = -1; st[i] = fu[i]
+
+    df["st_direction"] = d
+    ds = pd.Series(d, index=df.index)
+    df["st_long"] = (ds == 1) & (ds.shift(1) == -1)
+    df["st_short"] = (ds == -1) & (ds.shift(1) == 1)
+    return df
+
+
+def calc_ao(df):
+    df = df.copy()
+    mid = (df["high"] + df["low"]) / 2.0
+    df["ao"] = mid.rolling(AO_FAST).mean() - mid.rolling(AO_SLOW).mean()
+    return df
+
+
+def backtest_coin(df, mode="ao_fr"):
+    trades = []
+    pos = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        c, h, l = row["close"], row["high"], row["low"]
+
+        if pos:
+            if pos["side"] == "long":
+                if l <= pos["sl"]:
+                    trades.append({"pnl_pct": (pos["sl"] - pos["entry"]) / pos["entry"] * 100, "exit": "SL"})
+                    pos = None
+                elif h >= pos["tp"]:
+                    trades.append({"pnl_pct": (pos["tp"] - pos["entry"]) / pos["entry"] * 100, "exit": "TP"})
+                    pos = None
+                elif row["st_short"]:
+                    trades.append({"pnl_pct": (c - pos["entry"]) / pos["entry"] * 100, "exit": "FLIP"})
+                    pos = None
+            else:
+                if h >= pos["sl"]:
+                    trades.append({"pnl_pct": (pos["entry"] - pos["sl"]) / pos["entry"] * 100, "exit": "SL"})
+                    pos = None
+                elif l <= pos["tp"]:
+                    trades.append({"pnl_pct": (pos["entry"] - pos["tp"]) / pos["entry"] * 100, "exit": "TP"})
+                    pos = None
+                elif row["st_long"]:
+                    trades.append({"pnl_pct": (pos["entry"] - c) / pos["entry"] * 100, "exit": "FLIP"})
+                    pos = None
+
+        if pos:
+            continue
+
+        sig = None
+        if row["st_long"]:
+            sig = "long"
+        elif row["st_short"]:
+            sig = "short"
+        if not sig:
+            continue
+
+        # AO filter
+        if sig == "long" and row["ao"] <= 0:
+            continue
+        if sig == "short" and row["ao"] >= 0:
+            continue
+
+        # FR filter (nur wenn mode=ao_fr)
+        if mode == "ao_fr":
+            fr = row.get("funding_rate", np.nan)
+            if pd.notna(fr):
+                if sig == "long" and fr > FUNDING_LONG_MAX:
+                    continue
+                if sig == "short" and fr < FUNDING_SHORT_MIN:
+                    continue
+
+        atr = row["atr"]
+        if sig == "long":
+            pos = {"side": "long", "entry": c, "sl": c - SL_ATR_MULT * atr, "tp": c + TP_ATR_MULT * atr}
+        else:
+            pos = {"side": "short", "entry": c, "sl": c + SL_ATR_MULT * atr, "tp": c - TP_ATR_MULT * atr}
+
+    if not trades:
+        return None
+
+    pnls = np.array([t["pnl_pct"] - FEE_PCT * 2 for t in trades])
+    wins = (pnls > 0).sum()
+    total = len(pnls)
+    cum = np.cumsum(pnls)
+    max_dd = (cum - np.maximum.accumulate(cum)).min()
+    sharpe = pnls.mean() / pnls.std() * np.sqrt(total) if pnls.std() > 0 else 0
+    gp = pnls[pnls > 0].sum()
+    gl = abs(pnls[pnls <= 0].sum())
+    pf = gp / gl if gl > 0 else float("inf")
+
+    return {
+        "trades": total, "wins": wins, "winrate": wins / total * 100,
+        "total_pnl": pnls.sum(), "avg_pnl": pnls.mean(),
+        "max_dd": max_dd, "sharpe": sharpe, "pf": pf
+    }
+
+
+def main():
+    conn = psycopg2.connect(PG_DSN)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT symbol, COUNT(*), (MAX(timestamp)-MIN(timestamp))/1000.0/86400 as days
+        FROM kline_1h GROUP BY symbol HAVING (MAX(timestamp)-MIN(timestamp))/1000.0/86400 >= %s
+        ORDER BY days DESC
+    """, (MIN_DAYS,))
+    coins = [(r[0], r[1], r[2]) for r in cur.fetchall()]
+
+    print("=" * 95)
+    print("MULTI-COIN SUPERTREND BACKTEST — AO vs AO+FR")
+    print(f"Coins: {len(coins)} (>= {MIN_DAYS} Tage) | ST: ATR({ST_ATR_PERIOD}) x {ST_MULTIPLIER}")
+    print(f"SL: {SL_ATR_MULT}xATR | TP: {TP_ATR_MULT}xATR | Fee: {FEE_PCT}% per side")
+    print("=" * 95 + "\n")
+
+    results_ao = []
+    results_ao_fr = []
+
+    for idx, (sym, cnt, days) in enumerate(coins, 1):
+        df = pd.read_sql_query(
+            "SELECT timestamp, open, high, low, close, volume FROM kline_1h WHERE symbol=%s ORDER BY timestamp",
+            conn, params=(sym,))
+        df = calc_supertrend(df)
+        df = calc_ao(df)
+
+        # FR mergen
+        fr = pd.read_sql_query(
+            "SELECT timestamp, funding_rate FROM funding_rate WHERE symbol=%s ORDER BY timestamp",
+            conn, params=(sym,))
+        if len(fr) > 0:
+            df = pd.merge_asof(df.sort_values("timestamp"), fr.sort_values("timestamp"),
+                               on="timestamp", direction="backward")
+        else:
+            df["funding_rate"] = np.nan
+
+        df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+        r_ao = backtest_coin(df, mode="ao_only")
+        r_fr = backtest_coin(df, mode="ao_fr")
+
+        if r_ao:
+            r_ao["symbol"] = sym; r_ao["days"] = days; results_ao.append(r_ao)
+        if r_fr:
+            r_fr["symbol"] = sym; r_fr["days"] = days; results_ao_fr.append(r_fr)
+
+        pnl_ao = r_ao["total_pnl"] if r_ao else 0
+        pnl_fr = r_fr["total_pnl"] if r_fr else 0
+        sh_ao = r_ao["sharpe"] if r_ao else 0
+        sh_fr = r_fr["sharpe"] if r_fr else 0
+        better = "FR+" if sh_fr > sh_ao else "AO+"
+        print(f"[{idx:>2}/{len(coins)}] {sym:<16s} AO: {pnl_ao:>+7.1f}% Sh={sh_ao:>5.2f} | "
+              f"AO+FR: {pnl_fr:>+7.1f}% Sh={sh_fr:>5.2f} | {better}")
+
+    conn.close()
+
+    # === RANKING AO+FR ===
+    results_ao_fr.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'=' * 95}")
+    print("RANKING: AO+FR (sortiert nach Sharpe)")
+    print(f"{'=' * 95}")
+    print(f"{'Symbol':<16s} {'Days':>5s} {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'AvgPnL':>7s} {'MaxDD':>7s} {'Sharpe':>7s} {'PF':>6s}")
+    print("-" * 95)
+    for r in results_ao_fr:
+        print(f"{r['symbol']:<16s} {r['days']:>5.0f} {r['trades']:>6d} {r['winrate']:>4.0f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['avg_pnl']:>+6.2f}% {r['max_dd']:>6.1f}% "
+              f"{r['sharpe']:>7.2f} {r['pf']:>5.2f}")
+
+    # === VERGLEICH AO vs AO+FR ===
+    print(f"\n{'=' * 95}")
+    print("VERGLEICH: AO only vs AO+FR (nach Symbol)")
+    print(f"{'=' * 95}")
+    print(f"{'Symbol':<16s} {'AO Sharpe':>10s} {'AO PnL%':>9s} {'FR Sharpe':>10s} {'FR PnL%':>9s} {'Besser':>8s}")
+    print("-" * 70)
+
+    ao_dict = {r["symbol"]: r for r in results_ao}
+    fr_dict = {r["symbol"]: r for r in results_ao_fr}
+    fr_better = 0
+    for sym in sorted(set(list(ao_dict.keys()) + list(fr_dict.keys()))):
+        a = ao_dict.get(sym)
+        f = fr_dict.get(sym)
+        sh_a = a["sharpe"] if a else 0
+        sh_f = f["sharpe"] if f else 0
+        pnl_a = a["total_pnl"] if a else 0
+        pnl_f = f["total_pnl"] if f else 0
+        better = "AO+FR" if sh_f > sh_a else "AO"
+        if sh_f > sh_a:
+            fr_better += 1
+        print(f"{sym:<16s} {sh_a:>10.2f} {pnl_a:>+8.1f}% {sh_f:>10.2f} {pnl_f:>+8.1f}% {better:>8s}")
+
+    total_compared = len(set(list(ao_dict.keys()) + list(fr_dict.keys())))
+    print(f"\nAO+FR besser bei {fr_better}/{total_compared} Coins")
+
+    # === EMPFOHLENE COIN-LISTE ===
+    good = [r for r in results_ao_fr if r["sharpe"] > 0.5]
+    good.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'=' * 95}")
+    print(f"EMPFOHLENE COIN-LISTE FÜR MULTI-COIN BOT (Sharpe > 0.5, AO+FR):")
+    print(f"{'=' * 95}")
+    for r in good:
+        print(f"  {r['symbol']:<16s} Sharpe={r['sharpe']:.2f} | PnL={r['total_pnl']:+.1f}% | "
+              f"{r['trades']} trades | WR={r['winrate']:.0f}% | MaxDD={r['max_dd']:.1f}%")
+
+    print(f"\nTotal: {len(good)} Coins")
+
+    if good:
+        total_trades = sum(r["trades"] for r in good)
+        avg_sharpe = np.mean([r["sharpe"] for r in good])
+        avg_pnl = np.mean([r["total_pnl"] for r in good])
+        avg_wr = np.mean([r["winrate"] for r in good])
+        print(f"\nPortfolio Stats (gleichgewichtet):")
+        print(f"  Total Trades: {total_trades} (~{total_trades/1000*7:.1f}/Woche)")
+        print(f"  Avg Sharpe: {avg_sharpe:.2f}")
+        print(f"  Avg PnL/Coin: {avg_pnl:+.1f}%")
+        print(f"  Avg Winrate: {avg_wr:.1f}%")
+
+
+if __name__ == "__main__":
+    main()

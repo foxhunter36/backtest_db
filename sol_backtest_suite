@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""
+SOL SUPERTREND + AO — Comprehensive Backtest Suite
+═══════════════════════════════════════════════════
+Test 1: Filter Combinations (AO+FR, AO only, FR only, none)
+Test 2: Supertrend Parameter Grid (ATR Period × Multiplier)
+Test 3: AO Parameter Scan (Fast × Slow)
+Test 4: Trail Parameter Grid (Activation % × Trail ATR Mult)
+Test 5: Catastrophe SL Scan
+Test 6: Combined Best vs Live
+Test 7: Walk-Forward Validation (70/30)
+Test 8: Detailed Risk Metrics
+
+Läuft auf Trading Station, DB via Tailscale.
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+from itertools import product
+from scipy import stats as sp_stats
+
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+SYMBOL = "SOLUSDT"
+TABLE = "kline_1h"
+FEE_PCT = 0.055  # 0.055% taker per side
+
+# Live defaults
+ST_ATR_PERIOD = 14
+ST_MULTIPLIER = 2.0
+AO_FAST = 7
+AO_SLOW = 34
+FUNDING_LONG_MAX = 0.0001
+FUNDING_SHORT_MIN = -0.0001
+CATASTROPHE_SL_MULT = 6.0
+TRAIL_ACT_PCT = 3.0
+TRAIL_ATR_MULT = 0.5
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DATA LOADING
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_data():
+    conn = psycopg2.connect(PG_DSN)
+    raw = pd.read_sql_query(
+        f"SELECT timestamp, open, high, low, close, volume FROM {TABLE} "
+        f"WHERE symbol=%s ORDER BY timestamp", conn, params=(SYMBOL,))
+    fr = pd.read_sql_query(
+        "SELECT timestamp, funding_rate FROM funding_rate "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(SYMBOL,))
+    conn.close()
+
+    if len(fr) > 0:
+        raw = pd.merge_asof(raw.sort_values("timestamp"), fr.sort_values("timestamp"),
+                            on="timestamp", direction="backward")
+    else:
+        raw["funding_rate"] = np.nan
+
+    print(f"  {len(raw)} Candles geladen ({len(raw)/24:.0f} Tage)")
+    print(f"  Funding Rate Datenpunkte: {fr['funding_rate'].notna().sum() if len(fr) > 0 else 0}")
+    return raw
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDICATORS
+# ═══════════════════════════════════════════════════════════════════════
+
+def calc_atr(df, period):
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+
+def calc_supertrend(df, period=ST_ATR_PERIOD, multiplier=ST_MULTIPLIER):
+    df = df.copy()
+    atr = calc_atr(df, period)
+    df["atr"] = atr
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper = (hl2 + multiplier * atr).values
+    lower = (hl2 - multiplier * atr).values
+    close = df["close"].values
+    n = len(df)
+
+    fu = np.full(n, np.nan)
+    fl = np.full(n, np.nan)
+    d = np.zeros(n, dtype=int)
+
+    s = period
+    if s >= n:
+        df["st_direction"] = 0
+        df["st_long"] = False
+        df["st_short"] = False
+        return df
+
+    fu[s] = upper[s]
+    fl[s] = lower[s]
+    d[s] = -1
+
+    for i in range(s + 1, n):
+        fu[i] = upper[i] if (upper[i] < fu[i - 1] or close[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = lower[i] if (lower[i] > fl[i - 1] or close[i - 1] < fl[i - 1]) else fl[i - 1]
+        if d[i - 1] == 1:
+            d[i] = -1 if close[i] < fl[i] else 1
+        else:
+            d[i] = 1 if close[i] > fu[i] else -1
+
+    df["st_direction"] = d
+    ds = pd.Series(d, index=df.index)
+    df["st_long"] = (ds == 1) & (ds.shift(1) == -1)
+    df["st_short"] = (ds == -1) & (ds.shift(1) == 1)
+    return df
+
+
+def calc_ao(df, fast=AO_FAST, slow=AO_SLOW):
+    df = df.copy()
+    mid = (df["high"] + df["low"]) / 2.0
+    df["ao"] = mid.rolling(fast).mean() - mid.rolling(slow).mean()
+    return df
+
+
+def prepare_df(raw, st_period=ST_ATR_PERIOD, st_mult=ST_MULTIPLIER,
+               ao_fast=AO_FAST, ao_slow=AO_SLOW):
+    """Berechnet alle Indikatoren auf raw-Daten."""
+    df = calc_supertrend(raw, st_period, st_mult)
+    df = calc_ao(df, ao_fast, ao_slow)
+    df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SIGNAL CHECK (konfigurierbar)
+# ═══════════════════════════════════════════════════════════════════════
+
+def check_signal(row, ao_enabled=True, fr_enabled=True,
+                 fr_long_max=FUNDING_LONG_MAX, fr_short_min=FUNDING_SHORT_MIN):
+    """Signal-Check mit konfigurierbaren Filtern."""
+    sig = None
+    if row["st_long"]:
+        sig = "long"
+    elif row["st_short"]:
+        sig = "short"
+    if not sig:
+        return None
+
+    # AO Filter
+    if ao_enabled:
+        if sig == "long" and row["ao"] <= 0:
+            return None
+        if sig == "short" and row["ao"] >= 0:
+            return None
+
+    # Funding Rate Filter
+    if fr_enabled:
+        fr = row.get("funding_rate", np.nan)
+        if pd.notna(fr):
+            if sig == "long" and fr > fr_long_max:
+                return None
+            if sig == "short" and fr < fr_short_min:
+                return None
+
+    if row["atr"] <= 0:
+        return None
+
+    return sig
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BACKTEST ENGINE — Hybrid Exit (Live-Logik)
+# ═══════════════════════════════════════════════════════════════════════
+
+def backtest_hybrid(df, trail_act=TRAIL_ACT_PCT, trail_off=TRAIL_ATR_MULT,
+                    catastrophe_sl_mult=CATASTROPHE_SL_MULT,
+                    ao_enabled=True, fr_enabled=True,
+                    fr_long_max=FUNDING_LONG_MAX, fr_short_min=FUNDING_SHORT_MIN):
+    """
+    Hybrid Exit: Kein normaler SL. Catastrophe SL als Sicherheitsnetz.
+    Trail bei +trail_act%, Offset trail_off×ATR. Vor Trail nur ST-Flip.
+    """
+    trades = []
+    pos = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        c, h, l = row["close"], row["high"], row["low"]
+
+        if pos:
+            pnl_now = ((c - pos["entry"]) / pos["entry"] * 100
+                       if pos["side"] == "long"
+                       else (pos["entry"] - c) / pos["entry"] * 100)
+
+            # Trail Activation
+            if not pos["trail_active"] and pnl_now >= trail_act:
+                off = row["atr"] * trail_off
+                pos["trail_price"] = (c - off) if pos["side"] == "long" else (c + off)
+                pos["trail_active"] = True
+                pos["trail_off_abs"] = off
+
+            # Trail Update
+            if pos["trail_active"]:
+                if pos["side"] == "long":
+                    nt = h - pos["trail_off_abs"]
+                    if nt > pos["trail_price"]:
+                        pos["trail_price"] = nt
+                else:
+                    nt = l + pos["trail_off_abs"]
+                    if nt < pos["trail_price"]:
+                        pos["trail_price"] = nt
+
+            # Exit Checks
+            ex = False
+            if pos["side"] == "long":
+                if catastrophe_sl_mult and l <= pos["cat_sl"]:
+                    pnl = (pos["cat_sl"] - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "CAT_SL",
+                                   "bars": i - pos["bar"], "side": "long"})
+                    ex = True
+                elif pos["trail_active"] and l <= pos["trail_price"]:
+                    pnl = (pos["trail_price"] - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "TRAIL",
+                                   "bars": i - pos["bar"], "side": "long"})
+                    ex = True
+                elif row["st_short"]:
+                    pnl = (c - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "FLIP",
+                                   "bars": i - pos["bar"], "side": "long"})
+                    ex = True
+            else:
+                if catastrophe_sl_mult and h >= pos["cat_sl"]:
+                    pnl = (pos["entry"] - pos["cat_sl"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "CAT_SL",
+                                   "bars": i - pos["bar"], "side": "short"})
+                    ex = True
+                elif pos["trail_active"] and h >= pos["trail_price"]:
+                    pnl = (pos["entry"] - pos["trail_price"]) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "TRAIL",
+                                   "bars": i - pos["bar"], "side": "short"})
+                    ex = True
+                elif row["st_long"]:
+                    pnl = (pos["entry"] - c) / pos["entry"] * 100
+                    trades.append({"pnl": pnl, "exit": "FLIP",
+                                   "bars": i - pos["bar"], "side": "short"})
+                    ex = True
+
+            if ex:
+                pos = None
+            else:
+                continue
+
+        if pos:
+            continue
+
+        sig = check_signal(row, ao_enabled=ao_enabled, fr_enabled=fr_enabled,
+                           fr_long_max=fr_long_max, fr_short_min=fr_short_min)
+        if not sig:
+            continue
+
+        atr_val = row["atr"]
+        if sig == "long":
+            cat_sl = c - catastrophe_sl_mult * atr_val if catastrophe_sl_mult else 0
+            pos = {"side": "long", "entry": c, "cat_sl": cat_sl, "bar": i,
+                   "trail_active": False, "trail_price": 0, "trail_off_abs": 0}
+        else:
+            cat_sl = c + catastrophe_sl_mult * atr_val if catastrophe_sl_mult else 999999
+            pos = {"side": "short", "entry": c, "cat_sl": cat_sl, "bar": i,
+                   "trail_active": False, "trail_price": 0, "trail_off_abs": 0}
+
+    # Close open
+    if pos:
+        c = df.iloc[-1]["close"]
+        if pos["side"] == "long":
+            pnl = (c - pos["entry"]) / pos["entry"] * 100
+        else:
+            pnl = (pos["entry"] - c) / pos["entry"] * 100
+        trades.append({"pnl": pnl, "exit": "END", "bars": len(df) - pos["bar"],
+                       "side": pos["side"]})
+
+    return trades
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  STATS / METRICS
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_stats(trades, days=None):
+    """Berechnet alle Metriken aus Trade-Liste."""
+    if not trades:
+        return None
+
+    pnls = np.array([t["pnl"] - FEE_PCT * 2 for t in trades])
+    bars = np.array([t["bars"] for t in trades])
+    total = len(pnls)
+    wins = (pnls > 0).sum()
+
+    total_pnl = pnls.sum()
+    avg_pnl = pnls.mean()
+    std_pnl = pnls.std() if total > 1 else 0
+
+    # Cumulative PnL & Drawdown
+    cum = np.cumsum(pnls)
+    running_max = np.maximum.accumulate(cum)
+    drawdown = cum - running_max
+    max_dd = drawdown.min() if len(drawdown) > 0 else 0
+
+    # Win/Loss
+    win_pnls = pnls[pnls > 0]
+    loss_pnls = pnls[pnls <= 0]
+    avg_win = win_pnls.mean() if len(win_pnls) > 0 else 0
+    avg_loss = loss_pnls.mean() if len(loss_pnls) > 0 else 0
+    win_rate = wins / total * 100
+
+    # Profit Factor
+    gross_profit = win_pnls.sum() if len(win_pnls) > 0 else 0
+    gross_loss = abs(loss_pnls.sum()) if len(loss_pnls) > 0 else 0.001
+    pf = gross_profit / gross_loss
+
+    # Sharpe (annualisiert)
+    if days and days > 0:
+        trades_per_year = total / (days / 365)
+    else:
+        trades_per_year = total
+    sharpe = avg_pnl / std_pnl * np.sqrt(trades_per_year) if std_pnl > 0 else 0
+
+    # Sortino
+    downside = pnls[pnls < 0]
+    downside_std = np.sqrt(np.mean(downside ** 2)) if len(downside) > 0 else 0
+    sortino = avg_pnl / downside_std * np.sqrt(trades_per_year) if downside_std > 0 else 0
+
+    # Calmar
+    annualized_return = total_pnl / (days / 365) if days and days > 0 else total_pnl
+    calmar = annualized_return / abs(max_dd) if max_dd != 0 else 0
+
+    # Consecutive
+    max_cw = max_cl = cw = cl = 0
+    for p in pnls:
+        if p > 0:
+            cw += 1; cl = 0; max_cw = max(max_cw, cw)
+        else:
+            cl += 1; cw = 0; max_cl = max(max_cl, cl)
+
+    # Exits
+    exits = {}
+    for t in trades:
+        exits[t["exit"]] = exits.get(t["exit"], 0) + 1
+
+    # Side split
+    longs = sum(1 for t in trades if t["side"] == "long")
+    shorts = sum(1 for t in trades if t["side"] == "short")
+
+    # Payoff Ratio
+    payoff = avg_win / abs(avg_loss) if avg_loss != 0 else float("inf")
+
+    # Recovery Factor
+    recovery = total_pnl / abs(max_dd) if max_dd != 0 else 0
+
+    # Skewness / Kurtosis
+    skew = sp_stats.skew(pnls) if total >= 3 else 0
+    kurt = sp_stats.kurtosis(pnls) if total >= 4 else 0
+
+    return {
+        "trades": total, "wins": wins, "winrate": win_rate,
+        "total_pnl": total_pnl, "avg_pnl": avg_pnl, "std_pnl": std_pnl,
+        "avg_win": avg_win, "avg_loss": avg_loss, "payoff": payoff,
+        "max_dd": max_dd, "avg_bars": bars.mean(),
+        "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
+        "pf": pf, "recovery": recovery,
+        "max_consec_wins": max_cw, "max_consec_losses": max_cl,
+        "longs": longs, "shorts": shorts,
+        "skewness": skew, "kurtosis": kurt,
+        "exits": exits,
+    }
+
+
+def fmt(r):
+    """Einzeilige Ausgabe einer Stats-Dict."""
+    if not r:
+        return "(keine Trades)"
+    exits_str = " ".join(f"{k}:{v}" for k, v in sorted(r["exits"].items()))
+    return (f"{r['trades']:>5d} {r['winrate']:>4.0f}% {r['total_pnl']:>+7.1f}% "
+            f"{r['sharpe']:>6.2f} {r['sortino']:>7.2f} {r['pf']:>5.2f} "
+            f"{r['max_dd']:>6.1f}%  {exits_str}")
+
+
+def fmt_header():
+    return (f"{'Trades':>5s} {'WR%':>4s} {'PnL%':>7s} {'Sharpe':>6s} "
+            f"{'Sortino':>7s} {'PF':>5s} {'MaxDD':>6s}  Exits")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 1: FILTER COMBINATIONS (AO × FR)
+#  → Beantwortet: Bringt FR was? Bringt AO was? Beste Kombi?
+# ═══════════════════════════════════════════════════════════════════════
+
+def test1_filters(df, days):
+    print("\n" + "=" * 90)
+    print("TEST 1: FILTER COMBINATIONS (AO × FR)")
+    print("=" * 90)
+    print("  Alle Tests mit Live-Exit: Hybrid (Cat SL 6×ATR, Trail +3%/0.5×ATR)")
+
+    configs = [
+        ("AO + FR (LIVE)",       True,  True),
+        ("AO only (kein FR)",    True,  False),
+        ("FR only (kein AO)",    False, True),
+        ("Keine Filter",         False, False),
+    ]
+
+    print(f"\n  {'Config':<25s} | {fmt_header()}")
+    print("-" * 100)
+
+    results = {}
+    for name, ao_on, fr_on in configs:
+        trades = backtest_hybrid(df, ao_enabled=ao_on, fr_enabled=fr_on)
+        r = compute_stats(trades, days)
+        marker = " <-- LIVE" if ao_on and fr_on else ""
+        if r:
+            print(f"  {name:<25s} | {fmt(r)}{marker}")
+            results[name] = r
+
+    # FR Impact Detail
+    if "AO + FR (LIVE)" in results and "AO only (kein FR)" in results:
+        live = results["AO + FR (LIVE)"]
+        no_fr = results["AO only (kein FR)"]
+        blocked = no_fr["trades"] - live["trades"]
+        sharpe_diff = live["sharpe"] - no_fr["sharpe"]
+        pnl_diff = live["total_pnl"] - no_fr["total_pnl"]
+        print(f"\n  FR IMPACT:")
+        print(f"    Trades blockiert durch FR: {blocked}")
+        print(f"    Sharpe Δ:  {sharpe_diff:+.2f} ({'besser' if sharpe_diff > 0 else 'schlechter'} mit FR)")
+        print(f"    PnL Δ:     {pnl_diff:+.1f}% ({'besser' if pnl_diff > 0 else 'schlechter'} mit FR)")
+        print(f"    MaxDD Δ:   {live['max_dd'] - no_fr['max_dd']:+.1f}%")
+        print(f"    WR Δ:      {live['winrate'] - no_fr['winrate']:+.1f}%")
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 2: SUPERTREND PARAMETER GRID
+# ═══════════════════════════════════════════════════════════════════════
+
+def test2_supertrend(raw, days):
+    print("\n" + "=" * 90)
+    print("TEST 2: SUPERTREND PARAMETER GRID (ATR Period × Multiplier)")
+    print("=" * 90)
+
+    periods = [7, 10, 14, 20, 28]
+    multipliers = [1.5, 2.0, 2.5, 3.0, 3.5]
+
+    results = []
+    total = len(periods) * len(multipliers)
+    done = 0
+
+    for period, mult in product(periods, multipliers):
+        done += 1
+        if done % 5 == 0:
+            print(f"  {done}/{total}...")
+        df = prepare_df(raw, st_period=period, st_mult=mult)
+        trades = backtest_hybrid(df)
+        r = compute_stats(trades, days)
+        if r:
+            r["period"] = period
+            r["mult"] = mult
+            results.append(r)
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n  {'Per':>4s} {'Mult':>5s} | {fmt_header()}")
+    print("-" * 90)
+    for r in results[:20]:
+        marker = " <-- LIVE" if r["period"] == 14 and r["mult"] == 2.0 else ""
+        marker = " <-- BEST" if r == results[0] else marker
+        print(f"  {r['period']:>4d} {r['mult']:>5.1f} | {fmt(r)}{marker}")
+
+    best = results[0]
+    print(f"\n>>> Best ST: ATR({best['period']}) × {best['mult']} (Sharpe={best['sharpe']:.2f})")
+    return best["period"], best["mult"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 3: AO PARAMETER SCAN
+# ═══════════════════════════════════════════════════════════════════════
+
+def test3_ao(raw, days, best_st_period, best_st_mult):
+    print("\n" + "=" * 90)
+    print(f"TEST 3: AO PARAMETER SCAN (ST: ATR{best_st_period}×{best_st_mult})")
+    print("=" * 90)
+
+    fasts = [3, 5, 7, 10, 14]
+    slows = [21, 26, 34, 40, 55]
+
+    results = []
+    for f, s in product(fasts, slows):
+        if f >= s:
+            continue
+        df = prepare_df(raw, st_period=best_st_period, st_mult=best_st_mult,
+                        ao_fast=f, ao_slow=s)
+        trades = backtest_hybrid(df)
+        r = compute_stats(trades, days)
+        if r:
+            r["ao_fast"] = f
+            r["ao_slow"] = s
+            results.append(r)
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n  {'Fast':>5s} {'Slow':>5s} | {fmt_header()}")
+    print("-" * 90)
+    for r in results[:20]:
+        marker = " <-- LIVE" if r["ao_fast"] == 7 and r["ao_slow"] == 34 else ""
+        marker = " <-- BEST" if r == results[0] else marker
+        print(f"  {r['ao_fast']:>5d} {r['ao_slow']:>5d} | {fmt(r)}{marker}")
+
+    best = results[0]
+    print(f"\n>>> Best AO: Fast={best['ao_fast']} Slow={best['ao_slow']} "
+          f"(Sharpe={best['sharpe']:.2f})")
+    return best["ao_fast"], best["ao_slow"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 4: TRAIL PARAMETER GRID
+# ═══════════════════════════════════════════════════════════════════════
+
+def test4_trail(df, days):
+    print("\n" + "=" * 90)
+    print("TEST 4: TRAIL PARAMETER GRID (Activation % × Trail ATR Mult)")
+    print("=" * 90)
+
+    activations = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+    offsets = [0.3, 0.5, 0.8, 1.0, 1.5, 2.0]
+
+    results = []
+    for act, off in product(activations, offsets):
+        trades = backtest_hybrid(df, trail_act=act, trail_off=off)
+        r = compute_stats(trades, days)
+        if r:
+            r["trail_act"] = act
+            r["trail_off"] = off
+            results.append(r)
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n  {'Act%':>5s} {'Off':>5s} | {fmt_header()}")
+    print("-" * 90)
+    for r in results[:20]:
+        marker = " <-- LIVE" if r["trail_act"] == 3.0 and r["trail_off"] == 0.5 else ""
+        marker = " <-- BEST" if r == results[0] else marker
+        print(f"  {r['trail_act']:>5.1f} {r['trail_off']:>5.1f} | {fmt(r)}{marker}")
+
+    best = results[0]
+    print(f"\n>>> Best Trail: Act={best['trail_act']}% Off={best['trail_off']}×ATR "
+          f"(Sharpe={best['sharpe']:.2f})")
+    return best["trail_act"], best["trail_off"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 5: CATASTROPHE SL SCAN
+# ═══════════════════════════════════════════════════════════════════════
+
+def test5_catastrophe_sl(df, days, best_trail_act, best_trail_off):
+    print("\n" + "=" * 90)
+    print(f"TEST 5: CATASTROPHE SL SCAN (Trail: +{best_trail_act}%/{best_trail_off}×ATR)")
+    print("=" * 90)
+
+    cat_mults = [None, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]
+
+    results = []
+    for cat in cat_mults:
+        trades = backtest_hybrid(df, trail_act=best_trail_act, trail_off=best_trail_off,
+                                 catastrophe_sl_mult=cat)
+        r = compute_stats(trades, days)
+        if r:
+            r["cat_sl"] = cat if cat else 0
+            results.append(r)
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n  {'CatSL':>6s} | {fmt_header()}")
+    print("-" * 90)
+    for r in results:
+        label = f"{r['cat_sl']:.0f}×ATR" if r["cat_sl"] > 0 else "OFF"
+        marker = " <-- LIVE" if r["cat_sl"] == 6.0 else ""
+        marker = " <-- BEST" if r == results[0] else marker
+        print(f"  {label:>6s} | {fmt(r)}{marker}")
+
+    best = results[0]
+    best_cat = best["cat_sl"] if best["cat_sl"] > 0 else None
+    print(f"\n>>> Best Cat SL: {best_cat if best_cat else 'OFF'} (Sharpe={best['sharpe']:.2f})")
+    return best_cat
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 6: COMBINED COMPARISON
+# ═══════════════════════════════════════════════════════════════════════
+
+def test6_comparison(raw, days, best_st_period, best_st_mult, best_ao_fast,
+                     best_ao_slow, best_trail_act, best_trail_off, best_cat_sl):
+    print("\n" + "=" * 90)
+    print("TEST 6: COMBINED COMPARISON")
+    print("=" * 90)
+
+    configs = [
+        ("LIVE (deployed)",
+         dict(st_p=14, st_m=2.0, ao_f=7, ao_s=34,
+              trail_act=3.0, trail_off=0.5, cat_sl=6.0)),
+        ("OPTIMIZED",
+         dict(st_p=best_st_period, st_m=best_st_mult,
+              ao_f=best_ao_fast, ao_s=best_ao_slow,
+              trail_act=best_trail_act, trail_off=best_trail_off,
+              cat_sl=best_cat_sl if best_cat_sl else 6.0)),
+    ]
+
+    print(f"\n  {'Config':<40s} | {fmt_header()}")
+    print("-" * 110)
+
+    for name, p in configs:
+        df = prepare_df(raw, st_period=p["st_p"], st_mult=p["st_m"],
+                        ao_fast=p["ao_f"], ao_slow=p["ao_s"])
+        trades = backtest_hybrid(df, trail_act=p["trail_act"], trail_off=p["trail_off"],
+                                 catastrophe_sl_mult=p["cat_sl"])
+        r = compute_stats(trades, days)
+        desc = (f"ST({p['st_p']},{p['st_m']}) AO({p['ao_f']},{p['ao_s']}) "
+                f"T({p['trail_act']}/{p['trail_off']}) Cat={p['cat_sl']}")
+        print(f"  {name:<40s} | {fmt(r)}")
+        print(f"    {desc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 7: WALK-FORWARD VALIDATION (70/30)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test7_walkforward(raw, best_st_period, best_st_mult, best_ao_fast,
+                      best_ao_slow, best_trail_act, best_trail_off, best_cat_sl):
+    print("\n" + "=" * 90)
+    print("TEST 7: WALK-FORWARD VALIDATION (70/30)")
+    print("=" * 90)
+
+    split = int(len(raw) * 0.7)
+    train_raw = raw.iloc[:split].reset_index(drop=True)
+    test_raw = raw.iloc[split:].reset_index(drop=True)
+    train_days = len(train_raw) / 24
+    test_days = len(test_raw) / 24
+
+    print(f"  Train: {len(train_raw)} bars ({train_days:.0f} Tage)")
+    print(f"  Test:  {len(test_raw)} bars ({test_days:.0f} Tage)")
+
+    configs = [
+        ("LIVE",
+         dict(st_p=14, st_m=2.0, ao_f=7, ao_s=34,
+              trail_act=3.0, trail_off=0.5, cat_sl=6.0)),
+        ("OPTIMIZED",
+         dict(st_p=best_st_period, st_m=best_st_mult,
+              ao_f=best_ao_fast, ao_s=best_ao_slow,
+              trail_act=best_trail_act, trail_off=best_trail_off,
+              cat_sl=best_cat_sl if best_cat_sl else 6.0)),
+    ]
+
+    print(f"\n  {'Config':<20s} | {'Set':<6s} | {fmt_header()}")
+    print("-" * 100)
+
+    for name, p in configs:
+        for label, data, d in [("Train", train_raw, train_days),
+                                ("Test", test_raw, test_days)]:
+            df = prepare_df(data, st_period=p["st_p"], st_mult=p["st_m"],
+                            ao_fast=p["ao_f"], ao_slow=p["ao_s"])
+            trades = backtest_hybrid(df, trail_act=p["trail_act"], trail_off=p["trail_off"],
+                                     catastrophe_sl_mult=p["cat_sl"])
+            r = compute_stats(trades, d)
+            print(f"  {name:<20s} | {label:<6s} | {fmt(r)}")
+
+    # FR Robustheit in Walk-Forward
+    print(f"\n  --- FR IMPACT Walk-Forward ---")
+    for label, data, d in [("Train", train_raw, train_days),
+                            ("Test", test_raw, test_days)]:
+        df = prepare_df(data)
+        t_on = backtest_hybrid(df, ao_enabled=True, fr_enabled=True)
+        t_off = backtest_hybrid(df, ao_enabled=True, fr_enabled=False)
+        r_on = compute_stats(t_on, d)
+        r_off = compute_stats(t_off, d)
+        if r_on and r_off:
+            print(f"  {label:<6s} FR ON:  Sharpe={r_on['sharpe']:.2f} PnL={r_on['total_pnl']:+.1f}% "
+                  f"Trades={r_on['trades']}")
+            print(f"  {label:<6s} FR OFF: Sharpe={r_off['sharpe']:.2f} PnL={r_off['total_pnl']:+.1f}% "
+                  f"Trades={r_off['trades']}")
+            delta = r_on['sharpe'] - r_off['sharpe']
+            print(f"  {label:<6s} Δ Sharpe: {delta:+.2f} "
+                  f"({'FR hilft' if delta > 0 else 'FR schadet'})")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 8: DETAILED RISK METRICS
+# ═══════════════════════════════════════════════════════════════════════
+
+def test8_risk_metrics(raw, days, best_st_period, best_st_mult, best_ao_fast,
+                       best_ao_slow, best_trail_act, best_trail_off, best_cat_sl):
+    print("\n" + "=" * 90)
+    print("TEST 8: DETAILED RISK METRICS")
+    print("=" * 90)
+
+    configs = [
+        ("LIVE",
+         dict(st_p=14, st_m=2.0, ao_f=7, ao_s=34,
+              trail_act=3.0, trail_off=0.5, cat_sl=6.0)),
+        ("OPTIMIZED",
+         dict(st_p=best_st_period, st_m=best_st_mult,
+              ao_f=best_ao_fast, ao_s=best_ao_slow,
+              trail_act=best_trail_act, trail_off=best_trail_off,
+              cat_sl=best_cat_sl if best_cat_sl else 6.0)),
+    ]
+
+    for name, p in configs:
+        df = prepare_df(raw, st_period=p["st_p"], st_mult=p["st_m"],
+                        ao_fast=p["ao_f"], ao_slow=p["ao_s"])
+        trades = backtest_hybrid(df, trail_act=p["trail_act"], trail_off=p["trail_off"],
+                                 catastrophe_sl_mult=p["cat_sl"])
+        r = compute_stats(trades, days)
+        if not r:
+            continue
+
+        exits = " | ".join(f"{k}:{v}" for k, v in sorted(r["exits"].items()))
+        print(f"\n  {name} — ST({p['st_p']},{p['st_m']}) AO({p['ao_f']},{p['ao_s']}) "
+              f"Trail({p['trail_act']}/{p['trail_off']}) Cat={p['cat_sl']}:")
+        print(f"    Trades:             {r['trades']:>6d} (L:{r['longs']} S:{r['shorts']})")
+        print(f"    Win Rate:           {r['winrate']:>6.1f}%")
+        print(f"    Total PnL:          {r['total_pnl']:>+6.1f}%")
+        print(f"    Avg PnL/Trade:      {r['avg_pnl']:>+6.3f}%")
+        print(f"    Std PnL:            {r['std_pnl']:>6.3f}%")
+        print(f"    Avg Win:            {r['avg_win']:>+6.3f}%")
+        print(f"    Avg Loss:           {r['avg_loss']:>+6.3f}%")
+        print(f"    Payoff Ratio:       {r['payoff']:>6.2f}")
+        print(f"    Max Drawdown:       {r['max_dd']:>6.1f}%")
+        print(f"    Avg Bars/Trade:     {r['avg_bars']:>6.1f}")
+        print(f"    Max Consec Wins:    {r['max_consec_wins']:>6d}")
+        print(f"    Max Consec Losses:  {r['max_consec_losses']:>6d}")
+        print(f"    ─── Ratios ───")
+        print(f"    Sharpe:             {r['sharpe']:>6.2f}")
+        print(f"    Sortino:            {r['sortino']:>6.2f}")
+        print(f"    Calmar:             {r['calmar']:>6.2f}")
+        print(f"    Profit Factor:      {r['pf']:>6.2f}")
+        print(f"    Recovery Factor:    {r['recovery']:>6.2f}")
+        print(f"    Skewness:           {r['skewness']:>+6.2f}")
+        print(f"    Kurtosis:           {r['kurtosis']:>+6.2f}")
+        print(f"    Exits:              {exits}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 90)
+    print("SOL SUPERTREND + AO — COMPREHENSIVE BACKTEST SUITE")
+    print(f"Symbol: {SYMBOL} | Timeframe: 1h | Strategy: Supertrend + AO + FR + Hybrid Exit")
+    print("=" * 90)
+
+    raw = load_data()
+    days = len(raw) / 24
+
+    # Prepare mit Live-Parametern für Tests die kein ST/AO-Scan brauchen
+    df_live = prepare_df(raw)
+
+    # Test 1: Filter Combinations (beantwortet FR-Frage)
+    filter_results = test1_filters(df_live, days)
+
+    # Test 2: Supertrend Parameter Grid
+    best_st_period, best_st_mult = test2_supertrend(raw, days)
+
+    # Test 3: AO Parameter Scan (mit bestem ST)
+    best_ao_fast, best_ao_slow = test3_ao(raw, days, best_st_period, best_st_mult)
+
+    # Prepare mit besten Indikatoren für Exit-Tests
+    df_opt = prepare_df(raw, st_period=best_st_period, st_mult=best_st_mult,
+                        ao_fast=best_ao_fast, ao_slow=best_ao_slow)
+
+    # Test 4: Trail Grid
+    best_trail_act, best_trail_off = test4_trail(df_opt, days)
+
+    # Test 5: Catastrophe SL Scan
+    best_cat_sl = test5_catastrophe_sl(df_opt, days, best_trail_act, best_trail_off)
+
+    # Test 6: Combined Comparison
+    test6_comparison(raw, days, best_st_period, best_st_mult, best_ao_fast,
+                     best_ao_slow, best_trail_act, best_trail_off, best_cat_sl)
+
+    # Test 7: Walk-Forward
+    test7_walkforward(raw, best_st_period, best_st_mult, best_ao_fast,
+                      best_ao_slow, best_trail_act, best_trail_off, best_cat_sl)
+
+    # Test 8: Risk Metrics
+    test8_risk_metrics(raw, days, best_st_period, best_st_mult, best_ao_fast,
+                       best_ao_slow, best_trail_act, best_trail_off, best_cat_sl)
+
+    # Summary
+    print("\n" + "=" * 90)
+    print("ZUSAMMENFASSUNG")
+    print("=" * 90)
+    print(f"  Optimale Parameter:")
+    print(f"    Supertrend:    ATR({best_st_period}) × {best_st_mult}")
+    print(f"    AO:            Fast={best_ao_fast} Slow={best_ao_slow}")
+    print(f"    Trail:         +{best_trail_act}% / {best_trail_off}×ATR")
+    print(f"    Catastrophe:   {best_cat_sl if best_cat_sl else 'OFF'}×ATR")
+    print(f"    Filter:        AO=ON, FR=ON")
+    print(f"\n  vs. Live:")
+    print(f"    Supertrend:    ATR(14) × 2.0")
+    print(f"    AO:            Fast=7 Slow=34")
+    print(f"    Trail:         +3.0% / 0.5×ATR")
+    print(f"    Catastrophe:   6.0×ATR")
+    print(f"    Filter:        AO=ON, FR=ON")
+
+
+if __name__ == "__main__":
+    main()

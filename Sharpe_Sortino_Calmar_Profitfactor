@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""
+SOL Supertrend — Erweiterte Risk Metriken
+═════════════════════════════════════════
+Sharpe, Sortino, Calmar, Profit Factor, plus weitere Metriken
+für alle Top-Configs im direkten Vergleich.
+
+Läuft auf Trading Station, DB via Tailscale.
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+SYMBOL = "SOLUSDT"
+
+ST_ATR_PERIOD = 14
+ST_MULTIPLIER = 2.0
+AO_FAST = 7
+AO_SLOW = 34
+FEE_PCT = 0.055
+FUNDING_LONG_MAX = 0.0001
+FUNDING_SHORT_MIN = -0.0001
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDICATORS
+# ═══════════════════════════════════════════════════════════════════════
+
+def calc_atr(df, period=ST_ATR_PERIOD):
+    tr = pd.concat([df["high"]-df["low"], (df["high"]-df["close"].shift(1)).abs(),
+                    (df["low"]-df["close"].shift(1)).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+
+def calc_supertrend(df):
+    df = df.copy()
+    atr = calc_atr(df); df["atr"] = atr
+    hl2 = (df["high"]+df["low"])/2.0
+    upper = (hl2+ST_MULTIPLIER*atr).values; lower = (hl2-ST_MULTIPLIER*atr).values
+    close = df["close"].values; n = len(df)
+    fu=np.full(n,np.nan); fl=np.full(n,np.nan); d=np.zeros(n,dtype=int)
+    s = ST_ATR_PERIOD
+    if s >= n:
+        df["st_direction"]=0; df["st_long"]=False; df["st_short"]=False; return df
+    fu[s]=upper[s]; fl[s]=lower[s]; d[s]=-1
+    for i in range(s+1,n):
+        fu[i]=upper[i] if (upper[i]<fu[i-1] or close[i-1]>fu[i-1]) else fu[i-1]
+        fl[i]=lower[i] if (lower[i]>fl[i-1] or close[i-1]<fl[i-1]) else fl[i-1]
+        if d[i-1]==1:
+            if close[i]<fl[i]: d[i]=-1
+            else: d[i]=1
+        else:
+            if close[i]>fu[i]: d[i]=1
+            else: d[i]=-1
+    df["st_direction"]=d
+    ds=pd.Series(d,index=df.index)
+    df["st_long"]=(ds==1)&(ds.shift(1)==-1); df["st_short"]=(ds==-1)&(ds.shift(1)==1)
+    return df
+
+def calc_ao(df):
+    df = df.copy()
+    mid=(df["high"]+df["low"])/2.0
+    df["ao"]=mid.rolling(AO_FAST).mean()-mid.rolling(AO_SLOW).mean()
+    return df
+
+def check_signal(row):
+    sig = None
+    if row["st_long"]: sig = "long"
+    elif row["st_short"]: sig = "short"
+    if not sig: return None
+    if sig == "long" and row["ao"] <= 0: return None
+    if sig == "short" and row["ao"] >= 0: return None
+    fr = row.get("funding_rate", np.nan)
+    if pd.notna(fr):
+        if sig == "long" and fr > FUNDING_LONG_MAX: return None
+        if sig == "short" and fr < FUNDING_SHORT_MIN: return None
+    if row["atr"] <= 0: return None
+    return sig
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BACKTEST ENGINES
+# ═══════════════════════════════════════════════════════════════════════
+
+def backtest_standard_trail(df, sl_mult, trail_act, trail_off):
+    trades = []; pos = None
+    for i in range(1, len(df)):
+        row = df.iloc[i]; c,h,l = row["close"],row["high"],row["low"]
+        if pos:
+            pnl_now = (c-pos["entry"])/pos["entry"]*100 if pos["side"]=="long" else (pos["entry"]-c)/pos["entry"]*100
+            if not pos["trail_active"] and pnl_now >= trail_act:
+                off = row["atr"]*trail_off
+                pos["trail_price"] = (c-off) if pos["side"]=="long" else (c+off)
+                pos["trail_active"]=True; pos["trail_off_abs"]=off
+            if pos["trail_active"]:
+                if pos["side"]=="long":
+                    nt=h-pos["trail_off_abs"]
+                    if nt>pos["trail_price"]: pos["trail_price"]=nt
+                else:
+                    nt=l+pos["trail_off_abs"]
+                    if nt<pos["trail_price"]: pos["trail_price"]=nt
+            ex=False
+            if pos["side"]=="long":
+                if l<=pos["sl"]: trades.append({"pnl":(pos["sl"]-pos["entry"])/pos["entry"]*100,"exit":"SL","bars":i-pos["bar"]}); ex=True
+                elif pos["trail_active"] and l<=pos["trail_price"]: trades.append({"pnl":(pos["trail_price"]-pos["entry"])/pos["entry"]*100,"exit":"TRAIL","bars":i-pos["bar"]}); ex=True
+                elif row["st_short"]: trades.append({"pnl":(c-pos["entry"])/pos["entry"]*100,"exit":"FLIP","bars":i-pos["bar"]}); ex=True
+            else:
+                if h>=pos["sl"]: trades.append({"pnl":(pos["entry"]-pos["sl"])/pos["entry"]*100,"exit":"SL","bars":i-pos["bar"]}); ex=True
+                elif pos["trail_active"] and h>=pos["trail_price"]: trades.append({"pnl":(pos["entry"]-pos["trail_price"])/pos["entry"]*100,"exit":"TRAIL","bars":i-pos["bar"]}); ex=True
+                elif row["st_long"]: trades.append({"pnl":(pos["entry"]-c)/pos["entry"]*100,"exit":"FLIP","bars":i-pos["bar"]}); ex=True
+            if ex: pos=None
+            else: continue
+        if pos: continue
+        sig=check_signal(row)
+        if not sig: continue
+        atr=row["atr"]
+        if sig=="long": pos={"side":"long","entry":c,"sl":c-sl_mult*atr,"bar":i,"trail_active":False,"trail_price":0,"trail_off_abs":0}
+        else: pos={"side":"short","entry":c,"sl":c+sl_mult*atr,"bar":i,"trail_active":False,"trail_price":0,"trail_off_abs":0}
+    return trades
+
+
+def backtest_hybrid(df, trail_act, trail_off, catastrophe_sl_mult=None):
+    trades = []; pos = None
+    for i in range(1, len(df)):
+        row = df.iloc[i]; c,h,l = row["close"],row["high"],row["low"]
+        if pos:
+            pnl_now = (c-pos["entry"])/pos["entry"]*100 if pos["side"]=="long" else (pos["entry"]-c)/pos["entry"]*100
+            if not pos["trail_active"] and pnl_now >= trail_act:
+                off = row["atr"]*trail_off
+                pos["trail_price"] = (c-off) if pos["side"]=="long" else (c+off)
+                pos["trail_active"]=True; pos["trail_off_abs"]=off
+            if pos["trail_active"]:
+                if pos["side"]=="long":
+                    nt=h-pos["trail_off_abs"]
+                    if nt>pos["trail_price"]: pos["trail_price"]=nt
+                else:
+                    nt=l+pos["trail_off_abs"]
+                    if nt<pos["trail_price"]: pos["trail_price"]=nt
+            ex=False
+            if pos["side"]=="long":
+                if catastrophe_sl_mult and l<=pos["cat_sl"]: trades.append({"pnl":(pos["cat_sl"]-pos["entry"])/pos["entry"]*100,"exit":"CAT_SL","bars":i-pos["bar"]}); ex=True
+                elif pos["trail_active"] and l<=pos["trail_price"]: trades.append({"pnl":(pos["trail_price"]-pos["entry"])/pos["entry"]*100,"exit":"TRAIL","bars":i-pos["bar"]}); ex=True
+                elif row["st_short"]: trades.append({"pnl":(c-pos["entry"])/pos["entry"]*100,"exit":"FLIP","bars":i-pos["bar"]}); ex=True
+            else:
+                if catastrophe_sl_mult and h>=pos["cat_sl"]: trades.append({"pnl":(pos["entry"]-pos["cat_sl"])/pos["entry"]*100,"exit":"CAT_SL","bars":i-pos["bar"]}); ex=True
+                elif pos["trail_active"] and h>=pos["trail_price"]: trades.append({"pnl":(pos["entry"]-pos["trail_price"])/pos["entry"]*100,"exit":"TRAIL","bars":i-pos["bar"]}); ex=True
+                elif row["st_long"]: trades.append({"pnl":(pos["entry"]-c)/pos["entry"]*100,"exit":"FLIP","bars":i-pos["bar"]}); ex=True
+            if ex: pos=None
+            else: continue
+        if pos: continue
+        sig=check_signal(row)
+        if not sig: continue
+        atr=row["atr"]
+        cat_sl_l = c - catastrophe_sl_mult*atr if catastrophe_sl_mult else 0
+        cat_sl_s = c + catastrophe_sl_mult*atr if catastrophe_sl_mult else 999999
+        if sig=="long": pos={"side":"long","entry":c,"cat_sl":cat_sl_l,"bar":i,"trail_active":False,"trail_price":0,"trail_off_abs":0}
+        else: pos={"side":"short","entry":c,"cat_sl":cat_sl_s,"bar":i,"trail_active":False,"trail_price":0,"trail_off_abs":0}
+    return trades
+
+
+def backtest_fixed_tp(df, sl_mult, tp_mult):
+    trades = []; pos = None
+    for i in range(1, len(df)):
+        row = df.iloc[i]; c,h,l = row["close"],row["high"],row["low"]
+        if pos:
+            if pos["side"]=="long":
+                if l<=pos["sl"]: trades.append({"pnl":(pos["sl"]-pos["entry"])/pos["entry"]*100,"exit":"SL","bars":i-pos["bar"]}); pos=None
+                elif h>=pos["tp"]: trades.append({"pnl":(pos["tp"]-pos["entry"])/pos["entry"]*100,"exit":"TP","bars":i-pos["bar"]}); pos=None
+                elif row["st_short"]: trades.append({"pnl":(c-pos["entry"])/pos["entry"]*100,"exit":"FLIP","bars":i-pos["bar"]}); pos=None
+            else:
+                if h>=pos["sl"]: trades.append({"pnl":(pos["entry"]-pos["sl"])/pos["entry"]*100,"exit":"SL","bars":i-pos["bar"]}); pos=None
+                elif l<=pos["tp"]: trades.append({"pnl":(pos["entry"]-pos["tp"])/pos["entry"]*100,"exit":"TP","bars":i-pos["bar"]}); pos=None
+                elif row["st_long"]: trades.append({"pnl":(pos["entry"]-c)/pos["entry"]*100,"exit":"FLIP","bars":i-pos["bar"]}); pos=None
+        if pos: continue
+        sig=check_signal(row)
+        if not sig: continue
+        atr=row["atr"]
+        if sig=="long": pos={"side":"long","entry":c,"sl":c-sl_mult*atr,"tp":c+tp_mult*atr,"bar":i}
+        else: pos={"side":"short","entry":c,"sl":c+sl_mult*atr,"tp":c-tp_mult*atr,"bar":i}
+    return trades
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  RISK METRIKEN
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_all_metrics(trades, label, days):
+    """Berechnet alle Risk-Metriken für eine Trade-Liste."""
+    if not trades:
+        return None
+
+    pnls = np.array([t["pnl"] - FEE_PCT * 2 for t in trades])
+    bars = np.array([t["bars"] for t in trades])
+    total = len(pnls)
+    wins = (pnls > 0).sum()
+    losses = (pnls <= 0).sum()
+
+    # Basis
+    total_pnl = pnls.sum()
+    avg_pnl = pnls.mean()
+    median_pnl = np.median(pnls)
+    std_pnl = pnls.std()
+
+    # Cumulative PnL & Drawdown
+    cum = np.cumsum(pnls)
+    running_max = np.maximum.accumulate(cum)
+    drawdown = cum - running_max
+    max_dd = drawdown.min()
+    max_dd_idx = np.argmin(drawdown)
+
+    # Drawdown Duration (Bars in Drawdown)
+    in_dd = drawdown < 0
+    dd_durations = []
+    current_dd = 0
+    for d in in_dd:
+        if d:
+            current_dd += 1
+        else:
+            if current_dd > 0:
+                dd_durations.append(current_dd)
+            current_dd = 0
+    if current_dd > 0:
+        dd_durations.append(current_dd)
+    max_dd_duration = max(dd_durations) if dd_durations else 0
+
+    # Win/Loss Stats
+    win_pnls = pnls[pnls > 0]
+    loss_pnls = pnls[pnls <= 0]
+    avg_win = win_pnls.mean() if len(win_pnls) > 0 else 0
+    avg_loss = loss_pnls.mean() if len(loss_pnls) > 0 else 0
+    max_win = win_pnls.max() if len(win_pnls) > 0 else 0
+    max_loss = loss_pnls.min() if len(loss_pnls) > 0 else 0
+    win_rate = wins / total * 100
+
+    # Consecutive Wins/Losses
+    max_consec_wins = 0
+    max_consec_losses = 0
+    cw = cl = 0
+    for p in pnls:
+        if p > 0:
+            cw += 1; cl = 0
+            max_consec_wins = max(max_consec_wins, cw)
+        else:
+            cl += 1; cw = 0
+            max_consec_losses = max(max_consec_losses, cl)
+
+    # ── RATIOS ──
+
+    # Sharpe Ratio (annualisiert)
+    # trades_per_year = total / (days/365)
+    trades_per_year = total / (days / 365) if days > 0 else total
+    sharpe = avg_pnl / std_pnl * np.sqrt(trades_per_year) if std_pnl > 0 else 0
+
+    # Sortino Ratio (nur Downside-Volatility)
+    downside_returns = pnls[pnls < 0]
+    downside_std = np.sqrt(np.mean(downside_returns**2)) if len(downside_returns) > 0 else 0
+    sortino = avg_pnl / downside_std * np.sqrt(trades_per_year) if downside_std > 0 else 0
+
+    # Calmar Ratio (annualisierte Returns / MaxDD)
+    annualized_return = total_pnl / (days / 365) if days > 0 else total_pnl
+    calmar = annualized_return / abs(max_dd) if max_dd != 0 else 0
+
+    # Profit Factor
+    gross_profit = win_pnls.sum() if len(win_pnls) > 0 else 0
+    gross_loss = abs(loss_pnls.sum()) if len(loss_pnls) > 0 else 0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    # Payoff Ratio (Avg Win / Avg Loss)
+    payoff_ratio = avg_win / abs(avg_loss) if avg_loss != 0 else float("inf")
+
+    # Expectancy (avg trade result)
+    expectancy = avg_pnl
+
+    # Recovery Factor (Total PnL / Max DD)
+    recovery_factor = total_pnl / abs(max_dd) if max_dd != 0 else 0
+
+    # Ulcer Index (RMS of Drawdowns)
+    dd_pct = drawdown  # already in %
+    ulcer_index = np.sqrt(np.mean(dd_pct**2))
+
+    # UPI (Ulcer Performance Index = Return / Ulcer Index)
+    upi = total_pnl / ulcer_index if ulcer_index > 0 else 0
+
+    # Tail Ratio (95th percentile win / 5th percentile loss)
+    p95 = np.percentile(pnls, 95) if total >= 20 else max_win
+    p5 = np.percentile(pnls, 5) if total >= 20 else max_loss
+    tail_ratio = abs(p95 / p5) if p5 != 0 else 0
+
+    # Skewness & Kurtosis
+    from scipy import stats as sp_stats
+    skewness = sp_stats.skew(pnls)
+    kurtosis = sp_stats.kurtosis(pnls)
+
+    # Exits
+    exits = {}
+    for t in trades:
+        exits[t["exit"]] = exits.get(t["exit"], 0) + 1
+
+    return {
+        "label": label,
+        "trades": total, "wins": wins, "losses": losses, "win_rate": win_rate,
+        "total_pnl": total_pnl, "avg_pnl": avg_pnl, "median_pnl": median_pnl,
+        "std_pnl": std_pnl,
+        "avg_win": avg_win, "avg_loss": avg_loss,
+        "max_win": max_win, "max_loss": max_loss,
+        "payoff_ratio": payoff_ratio,
+        "max_consec_wins": max_consec_wins, "max_consec_losses": max_consec_losses,
+        "max_dd": max_dd, "max_dd_duration": max_dd_duration,
+        "avg_bars": bars.mean(),
+        "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
+        "profit_factor": profit_factor, "recovery_factor": recovery_factor,
+        "ulcer_index": ulcer_index, "upi": upi,
+        "tail_ratio": tail_ratio, "skewness": skewness, "kurtosis": kurtosis,
+        "expectancy": expectancy,
+        "trades_per_week": total / (days / 7) if days > 0 else 0,
+        "annualized_return": annualized_return,
+        "exits": exits,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 100)
+    print("SOL SUPERTREND — COMPREHENSIVE RISK METRICS")
+    print("=" * 100)
+
+    conn = psycopg2.connect(PG_DSN)
+    raw = pd.read_sql_query(
+        "SELECT timestamp, open, high, low, close, volume FROM kline_1h "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(SYMBOL,))
+    fr = pd.read_sql_query(
+        "SELECT timestamp, funding_rate FROM funding_rate "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(SYMBOL,))
+    conn.close()
+
+    if len(fr) > 0:
+        raw = pd.merge_asof(raw.sort_values("timestamp"), fr.sort_values("timestamp"),
+                            on="timestamp", direction="backward")
+    else:
+        raw["funding_rate"] = np.nan
+
+    df = calc_supertrend(raw)
+    df = calc_ao(df)
+    df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+    days = len(df) / 24
+    print(f"Data: {len(df)} bars ({days:.0f} Tage)\n")
+
+    # ── Configs ──
+    configs = [
+        ("LIVE: SL2/Trail+4%/2.5x (AO+Vol)",
+         backtest_standard_trail(df, sl_mult=2.0, trail_act=4.0, trail_off=2.5)),
+        ("Fixed TP: SL2/TP3 (AO+FR)",
+         backtest_fixed_tp(df, sl_mult=2.0, tp_mult=3.0)),
+        ("Fixed TP: SL2/TP4 (AO+FR)",
+         backtest_fixed_tp(df, sl_mult=2.0, tp_mult=4.0)),
+        ("Std Trail: SL3/Trail+3%/0.5x (AO+FR)",
+         backtest_standard_trail(df, sl_mult=3.0, trail_act=3.0, trail_off=0.5)),
+        ("Hybrid: Trail+3%/0.5x (kein SL)",
+         backtest_hybrid(df, trail_act=3.0, trail_off=0.5)),
+        ("Hybrid+CatSL6: Trail+3%/0.5x",
+         backtest_hybrid(df, trail_act=3.0, trail_off=0.5, catastrophe_sl_mult=6.0)),
+        ("Flip Only (kein TP/Trail/SL)",
+         backtest_hybrid(df, trail_act=999, trail_off=0)),
+    ]
+
+    all_metrics = []
+    for label, trades in configs:
+        m = compute_all_metrics(trades, label, days)
+        if m:
+            all_metrics.append(m)
+
+    # ══════════════════════════════════════════════════════════════
+    #  OVERVIEW TABLE
+    # ══════════════════════════════════════════════════════════════
+    print("=" * 100)
+    print("OVERVIEW — Key Ratios")
+    print("=" * 100)
+
+    print(f"\n{'Config':<42s} | {'Sharpe':>7s} {'Sortino':>8s} {'Calmar':>7s} {'PF':>6s} {'RecovF':>7s} {'UPI':>6s}")
+    print("-" * 90)
+    for m in all_metrics:
+        print(f"{m['label']:<42s} | {m['sharpe']:>7.2f} {m['sortino']:>8.2f} {m['calmar']:>7.2f} "
+              f"{m['profit_factor']:>5.2f} {m['recovery_factor']:>7.2f} {m['upi']:>6.1f}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  DETAILED METRICS PER CONFIG
+    # ══════════════════════════════════════════════════════════════
+    for m in all_metrics:
+        print(f"\n{'═'*80}")
+        print(f"  {m['label']}")
+        print(f"{'═'*80}")
+
+        print(f"\n  ── Performance ──")
+        print(f"  Total PnL:           {m['total_pnl']:>+8.1f}%")
+        print(f"  Annualized Return:   {m['annualized_return']:>+8.1f}%/yr")
+        print(f"  Trades:              {m['trades']:>8d}  ({m['trades_per_week']:.1f}/week)")
+        print(f"  Win Rate:            {m['win_rate']:>7.1f}%")
+        print(f"  Avg PnL/Trade:       {m['avg_pnl']:>+7.3f}%")
+        print(f"  Median PnL/Trade:    {m['median_pnl']:>+7.3f}%")
+
+        print(f"\n  ── Win/Loss Analysis ──")
+        print(f"  Avg Win:             {m['avg_win']:>+7.3f}%")
+        print(f"  Avg Loss:            {m['avg_loss']:>+7.3f}%")
+        print(f"  Payoff Ratio:        {m['payoff_ratio']:>7.2f}x  (AvgWin/AvgLoss)")
+        print(f"  Best Trade:          {m['max_win']:>+7.2f}%")
+        print(f"  Worst Trade:         {m['max_loss']:>+7.2f}%")
+        print(f"  Max Consec Wins:     {m['max_consec_wins']:>8d}")
+        print(f"  Max Consec Losses:   {m['max_consec_losses']:>8d}")
+
+        print(f"\n  ── Risk Ratios ──")
+        print(f"  Sharpe Ratio:        {m['sharpe']:>7.2f}  (risk-adj return / total vol)")
+        print(f"  Sortino Ratio:       {m['sortino']:>7.2f}  (risk-adj return / downside vol)")
+        print(f"  Calmar Ratio:        {m['calmar']:>7.2f}  (annual return / max drawdown)")
+        print(f"  Profit Factor:       {m['profit_factor']:>7.2f}  (gross profit / gross loss)")
+        print(f"  Recovery Factor:     {m['recovery_factor']:>7.2f}  (total PnL / max drawdown)")
+        print(f"  Ulcer Perf Index:    {m['upi']:>7.1f}  (return / ulcer index)")
+
+        print(f"\n  ── Drawdown ──")
+        print(f"  Max Drawdown:        {m['max_dd']:>+7.1f}%")
+        print(f"  Max DD Duration:     {m['max_dd_duration']:>7d} trades")
+        print(f"  Ulcer Index:         {m['ulcer_index']:>7.2f}")
+
+        print(f"\n  ── Distribution ──")
+        print(f"  Std Dev:             {m['std_pnl']:>7.3f}%")
+        print(f"  Skewness:            {m['skewness']:>+7.3f}  (>0 = right tail, profitable)")
+        print(f"  Kurtosis:            {m['kurtosis']:>+7.3f}  (>0 = fat tails)")
+        print(f"  Tail Ratio (95/5):   {m['tail_ratio']:>7.2f}  (>1 = wins > losses at extremes)")
+
+        exits = " | ".join(f"{k}:{v}" for k, v in sorted(m["exits"].items()))
+        print(f"\n  ── Exits ──")
+        print(f"  {exits}")
+        print(f"  Avg Bars/Trade:      {m['avg_bars']:>7.1f}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  RANKING
+    # ══════════════════════════════════════════════════════════════
+    print(f"\n{'='*100}")
+    print("RANKING nach verschiedenen Kriterien")
+    print(f"{'='*100}")
+
+    for metric, label, reverse, fmt in [
+        ("sharpe", "Sharpe Ratio", True, ".2f"),
+        ("sortino", "Sortino Ratio", True, ".2f"),
+        ("calmar", "Calmar Ratio", True, ".2f"),
+        ("profit_factor", "Profit Factor", True, ".2f"),
+        ("recovery_factor", "Recovery Factor", True, ".2f"),
+        ("max_dd", "Max Drawdown (least)", False, "+.1f"),
+        ("total_pnl", "Total PnL", True, "+.1f"),
+        ("upi", "Ulcer Performance Index", True, ".1f"),
+        ("tail_ratio", "Tail Ratio", True, ".2f"),
+        ("skewness", "Skewness", True, "+.3f"),
+    ]:
+        ranked = sorted(all_metrics, key=lambda x: x[metric], reverse=reverse)
+        vals = " → ".join(f"{r['label'].split(':')[0]}({r[metric]:{fmt}})" for r in ranked[:3])
+        print(f"\n  {label}:")
+        print(f"    {vals}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  CONSENSUS RANKING
+    # ══════════════════════════════════════════════════════════════
+    print(f"\n{'='*100}")
+    print("CONSENSUS RANKING (Durchschnitt aller Rankings)")
+    print(f"{'='*100}")
+
+    rank_metrics = ["sharpe", "sortino", "calmar", "profit_factor", "recovery_factor",
+                    "upi", "tail_ratio"]
+    scores = {m["label"]: 0 for m in all_metrics}
+
+    for metric in rank_metrics:
+        ranked = sorted(all_metrics, key=lambda x: x[metric], reverse=True)
+        for rank, r in enumerate(ranked):
+            scores[r["label"]] += rank + 1
+
+    final_ranking = sorted(scores.items(), key=lambda x: x[1])
+    print()
+    for rank, (label, score) in enumerate(final_ranking, 1):
+        m = next(r for r in all_metrics if r["label"] == label)
+        print(f"  #{rank} (avg rank {score/len(rank_metrics):.1f}): {label}")
+        print(f"      Sharpe={m['sharpe']:.2f} Sortino={m['sortino']:.2f} Calmar={m['calmar']:.2f} "
+              f"PF={m['profit_factor']:.2f} PnL={m['total_pnl']:+.1f}%")
+
+
+if __name__ == "__main__":
+    main()

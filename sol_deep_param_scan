@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""
+Supertrend Deep Parameter Scan — 9 Coin Shortlist
+══════════════════════════════════════════════════
+Test 1: SL/TP ATR Multiplier Scan
+Test 2: Supertrend ATR Period × Multiplier Grid
+Test 3: Exit Strategy Comparison (TP/SL vs ST-Flip only)
+
+Läuft auf Trading Station, DB via Tailscale.
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+from itertools import product
+
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+
+COINS = ["PIXELUSDT", "XRPUSDT", "MBOXUSDT", "ICPUSDT", "SOLUSDT",
+         "RENDERUSDT", "DEXEUSDT", "AXSUSDT", "HBARUSDT"]
+
+# Defaults
+AO_FAST = 7
+AO_SLOW = 34
+FEE_PCT = 0.055
+FUNDING_LONG_MAX = 0.0001
+FUNDING_SHORT_MIN = -0.0001
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDICATORS
+# ═══════════════════════════════════════════════════════════════════════
+
+def calc_atr(df, period):
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+
+def calc_supertrend(df, period, multiplier):
+    df = df.copy()
+    atr = calc_atr(df, period)
+    df["atr"] = atr
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper = (hl2 + multiplier * atr).values
+    lower = (hl2 - multiplier * atr).values
+    close = df["close"].values
+    n = len(df)
+
+    fu = np.full(n, np.nan)
+    fl = np.full(n, np.nan)
+    d = np.zeros(n, dtype=int)
+
+    s = period
+    if s >= n:
+        df["st_direction"] = 0
+        df["st_long"] = False
+        df["st_short"] = False
+        return df
+
+    fu[s] = upper[s]; fl[s] = lower[s]; d[s] = -1
+
+    for i in range(s + 1, n):
+        fu[i] = upper[i] if (upper[i] < fu[i-1] or close[i-1] > fu[i-1]) else fu[i-1]
+        fl[i] = lower[i] if (lower[i] > fl[i-1] or close[i-1] < fl[i-1]) else fl[i-1]
+        if d[i-1] == 1:
+            if close[i] < fl[i]: d[i] = -1
+            else: d[i] = 1
+        else:
+            if close[i] > fu[i]: d[i] = 1
+            else: d[i] = -1
+
+    df["st_direction"] = d
+    ds = pd.Series(d, index=df.index)
+    df["st_long"] = (ds == 1) & (ds.shift(1) == -1)
+    df["st_short"] = (ds == -1) & (ds.shift(1) == 1)
+    return df
+
+
+def calc_ao(df):
+    df = df.copy()
+    mid = (df["high"] + df["low"]) / 2.0
+    df["ao"] = mid.rolling(AO_FAST).mean() - mid.rolling(AO_SLOW).mean()
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+def backtest(df, sl_mult, tp_mult, use_sl_tp=True):
+    """
+    use_sl_tp=True:  Exit via SL/TP oder ST-Flip (was zuerst kommt)
+    use_sl_tp=False: Exit NUR via ST-Flip (kein SL/TP)
+    """
+    trades = []
+    pos = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        c, h, l = row["close"], row["high"], row["low"]
+
+        if pos:
+            exited = False
+            if pos["side"] == "long":
+                if use_sl_tp and l <= pos["sl"]:
+                    pnl = (pos["sl"] - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl_pct": pnl, "exit": "SL", "bars": i - pos["bar"]})
+                    exited = True
+                elif use_sl_tp and h >= pos["tp"]:
+                    pnl = (pos["tp"] - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl_pct": pnl, "exit": "TP", "bars": i - pos["bar"]})
+                    exited = True
+                elif row["st_short"]:
+                    pnl = (c - pos["entry"]) / pos["entry"] * 100
+                    trades.append({"pnl_pct": pnl, "exit": "FLIP", "bars": i - pos["bar"]})
+                    exited = True
+            else:
+                if use_sl_tp and h >= pos["sl"]:
+                    pnl = (pos["entry"] - pos["sl"]) / pos["entry"] * 100
+                    trades.append({"pnl_pct": pnl, "exit": "SL", "bars": i - pos["bar"]})
+                    exited = True
+                elif use_sl_tp and l <= pos["tp"]:
+                    pnl = (pos["entry"] - pos["tp"]) / pos["entry"] * 100
+                    trades.append({"pnl_pct": pnl, "exit": "TP", "bars": i - pos["bar"]})
+                    exited = True
+                elif row["st_long"]:
+                    pnl = (pos["entry"] - c) / pos["entry"] * 100
+                    trades.append({"pnl_pct": pnl, "exit": "FLIP", "bars": i - pos["bar"]})
+                    exited = True
+
+            if exited:
+                pos = None
+            else:
+                continue
+
+        if pos:
+            continue
+
+        sig = None
+        if row["st_long"]: sig = "long"
+        elif row["st_short"]: sig = "short"
+        if not sig: continue
+
+        # AO filter
+        if sig == "long" and row["ao"] <= 0: continue
+        if sig == "short" and row["ao"] >= 0: continue
+
+        # FR filter
+        fr = row.get("funding_rate", np.nan)
+        if pd.notna(fr):
+            if sig == "long" and fr > FUNDING_LONG_MAX: continue
+            if sig == "short" and fr < FUNDING_SHORT_MIN: continue
+
+        atr = row["atr"]
+        if atr <= 0: continue
+
+        if sig == "long":
+            pos = {"side": "long", "entry": c,
+                   "sl": c - sl_mult * atr, "tp": c + tp_mult * atr, "bar": i}
+        else:
+            pos = {"side": "short", "entry": c,
+                   "sl": c + sl_mult * atr, "tp": c - tp_mult * atr, "bar": i}
+
+    if not trades:
+        return None
+
+    pnls = np.array([t["pnl_pct"] - FEE_PCT * 2 for t in trades])
+    bars = np.array([t["bars"] for t in trades])
+    wins = (pnls > 0).sum()
+    total = len(pnls)
+    cum = np.cumsum(pnls)
+    max_dd = (cum - np.maximum.accumulate(cum)).min()
+    sharpe = pnls.mean() / pnls.std() * np.sqrt(total) if pnls.std() > 0 else 0
+    gp = pnls[pnls > 0].sum()
+    gl = abs(pnls[pnls <= 0].sum())
+    pf = gp / gl if gl > 0 else float("inf")
+
+    exits = {}
+    for t in trades:
+        exits[t["exit"]] = exits.get(t["exit"], 0) + 1
+
+    return {
+        "trades": total, "wins": wins, "winrate": wins / total * 100,
+        "total_pnl": pnls.sum(), "avg_pnl": pnls.mean(),
+        "max_dd": max_dd, "sharpe": sharpe, "pf": pf,
+        "avg_bars": bars.mean(), "exits": exits
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DATA LOADING
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_coin_data(conn, symbol):
+    df = pd.read_sql_query(
+        "SELECT timestamp, open, high, low, close, volume FROM kline_1h "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(symbol,))
+
+    fr = pd.read_sql_query(
+        "SELECT timestamp, funding_rate FROM funding_rate "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(symbol,))
+
+    if len(fr) > 0:
+        df = pd.merge_asof(df.sort_values("timestamp"), fr.sort_values("timestamp"),
+                           on="timestamp", direction="backward")
+    else:
+        df["funding_rate"] = np.nan
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 1: SL/TP MULTIPLIER SCAN
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_sl_tp(conn):
+    print("\n" + "=" * 100)
+    print("TEST 1: SL/TP ATR MULTIPLIER SCAN (ST: ATR14 × 2.0, AO+FR)")
+    print("=" * 100)
+
+    sl_values = [1.0, 1.5, 2.0, 2.5, 3.0]
+    tp_values = [1.5, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+    # Precompute indicators for all coins
+    coin_data = {}
+    for sym in COINS:
+        df = load_coin_data(conn, sym)
+        df = calc_supertrend(df, period=14, multiplier=2.0)
+        df = calc_ao(df)
+        df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+        coin_data[sym] = df
+
+    results = []
+    for sl, tp in product(sl_values, tp_values):
+        if tp <= sl:
+            continue  # TP muss > SL sein (Risk/Reward > 1)
+
+        combo_sharpes = []
+        combo_pnls = []
+        combo_trades = 0
+
+        for sym in COINS:
+            r = backtest(coin_data[sym], sl_mult=sl, tp_mult=tp)
+            if r:
+                combo_sharpes.append(r["sharpe"])
+                combo_pnls.append(r["total_pnl"])
+                combo_trades += r["trades"]
+
+        if combo_sharpes:
+            results.append({
+                "sl": sl, "tp": tp,
+                "rr": tp / sl,
+                "avg_sharpe": np.mean(combo_sharpes),
+                "avg_pnl": np.mean(combo_pnls),
+                "total_trades": combo_trades,
+                "coins_profitable": sum(1 for p in combo_pnls if p > 0),
+            })
+
+    results.sort(key=lambda x: x["avg_sharpe"], reverse=True)
+
+    print(f"\n{'SL':>4s} {'TP':>4s} {'R:R':>5s} {'AvgSharpe':>10s} {'AvgPnL%':>9s} "
+          f"{'Trades':>7s} {'Profitable':>11s}")
+    print("-" * 60)
+    for r in results:
+        marker = " ***" if r["sl"] == 2.0 and r["tp"] == 3.0 else ""
+        print(f"{r['sl']:>4.1f} {r['tp']:>4.1f} {r['rr']:>5.2f} {r['avg_sharpe']:>10.2f} "
+              f"{r['avg_pnl']:>+8.1f}% {r['total_trades']:>7d} "
+              f"{r['coins_profitable']}/{len(COINS)}{marker}")
+
+    print("\n*** = aktuelles Live-Setup")
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 2: SUPERTREND PARAMETER GRID
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_st_params(conn, best_sl, best_tp):
+    print("\n" + "=" * 100)
+    print(f"TEST 2: SUPERTREND PARAMETER GRID (SL={best_sl}×ATR, TP={best_tp}×ATR, AO+FR)")
+    print("=" * 100)
+
+    atr_periods = [7, 10, 14, 20, 28]
+    st_multipliers = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+
+    results = []
+    total_combos = len(atr_periods) * len(st_multipliers)
+    done = 0
+
+    for period, mult in product(atr_periods, st_multipliers):
+        done += 1
+        combo_sharpes = []
+        combo_pnls = []
+        combo_trades = 0
+
+        for sym in COINS:
+            df = load_coin_data(conn, sym)
+            df = calc_supertrend(df, period=period, multiplier=mult)
+            df = calc_ao(df)
+            df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+            r = backtest(df, sl_mult=best_sl, tp_mult=best_tp)
+            if r:
+                combo_sharpes.append(r["sharpe"])
+                combo_pnls.append(r["total_pnl"])
+                combo_trades += r["trades"]
+
+        if combo_sharpes:
+            results.append({
+                "period": period, "mult": mult,
+                "avg_sharpe": np.mean(combo_sharpes),
+                "avg_pnl": np.mean(combo_pnls),
+                "total_trades": combo_trades,
+                "coins_profitable": sum(1 for p in combo_pnls if p > 0),
+            })
+
+        if done % 5 == 0:
+            print(f"  Progress: {done}/{total_combos}")
+
+    results.sort(key=lambda x: x["avg_sharpe"], reverse=True)
+
+    print(f"\n{'Period':>7s} {'Mult':>5s} {'AvgSharpe':>10s} {'AvgPnL%':>9s} "
+          f"{'Trades':>7s} {'Profitable':>11s}")
+    print("-" * 60)
+    for r in results:
+        marker = " ***" if r["period"] == 14 and r["mult"] == 2.0 else ""
+        print(f"{r['period']:>7d} {r['mult']:>5.1f} {r['avg_sharpe']:>10.2f} "
+              f"{r['avg_pnl']:>+8.1f}% {r['total_trades']:>7d} "
+              f"{r['coins_profitable']}/{len(COINS)}{marker}")
+
+    print("\n*** = aktuelles Live-Setup")
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 3: EXIT STRATEGY COMPARISON
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_exit_strategy(conn, best_sl, best_tp, best_period, best_mult):
+    print("\n" + "=" * 100)
+    print(f"TEST 3: EXIT STRATEGY (ST: ATR{best_period} × {best_mult}, AO+FR)")
+    print("=" * 100)
+
+    strategies = [
+        ("SL/TP + Flip", True, best_sl, best_tp),
+        ("Flip Only (kein SL/TP)", False, 999, 999),
+        ("Tight SL/TP (1.5/2)", True, 1.5, 2.0),
+        ("Wide SL/TP (3/5)", True, 3.0, 5.0),
+    ]
+
+    for name, use_sl_tp, sl, tp in strategies:
+        sharpes = []
+        pnls = []
+        total_trades = 0
+        all_exits = {}
+
+        for sym in COINS:
+            df = load_coin_data(conn, sym)
+            df = calc_supertrend(df, period=best_period, multiplier=best_mult)
+            df = calc_ao(df)
+            df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+            r = backtest(df, sl_mult=sl, tp_mult=tp, use_sl_tp=use_sl_tp)
+            if r:
+                sharpes.append(r["sharpe"])
+                pnls.append(r["total_pnl"])
+                total_trades += r["trades"]
+                for k, v in r["exits"].items():
+                    all_exits[k] = all_exits.get(k, 0) + v
+
+        avg_sh = np.mean(sharpes) if sharpes else 0
+        avg_pnl = np.mean(pnls) if pnls else 0
+        profitable = sum(1 for p in pnls if p > 0)
+        exit_str = " | ".join(f"{k}:{v}" for k, v in sorted(all_exits.items()))
+
+        print(f"\n  {name}:")
+        print(f"    Sharpe: {avg_sh:.2f} | PnL: {avg_pnl:+.1f}% | "
+              f"Trades: {total_trades} | Profitable: {profitable}/{len(COINS)}")
+        print(f"    Exits: {exit_str}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  FINAL: BEST COMBO PER COIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def final_per_coin(conn, best_sl, best_tp, best_period, best_mult):
+    print("\n" + "=" * 100)
+    print(f"FINALE ERGEBNISSE PRO COIN (ST: ATR{best_period} × {best_mult}, "
+          f"SL={best_sl}×ATR, TP={best_tp}×ATR, AO+FR)")
+    print("=" * 100)
+
+    print(f"\n{'Symbol':<16s} {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} {'AvgPnL':>7s} "
+          f"{'MaxDD':>7s} {'Sharpe':>7s} {'PF':>6s} {'AvgBars':>8s} {'Exits'}")
+    print("-" * 110)
+
+    total_sharpe = []
+    total_pnl = []
+
+    for sym in COINS:
+        df = load_coin_data(conn, sym)
+        df = calc_supertrend(df, period=best_period, multiplier=best_mult)
+        df = calc_ao(df)
+        df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+        r = backtest(df, sl_mult=best_sl, tp_mult=best_tp)
+        if r:
+            total_sharpe.append(r["sharpe"])
+            total_pnl.append(r["total_pnl"])
+            exit_str = " ".join(f"{k}:{v}" for k, v in sorted(r["exits"].items()))
+            print(f"{sym:<16s} {r['trades']:>6d} {r['winrate']:>4.0f}% "
+                  f"{r['total_pnl']:>+7.1f}% {r['avg_pnl']:>+6.2f}% {r['max_dd']:>6.1f}% "
+                  f"{r['sharpe']:>7.2f} {r['pf']:>5.2f} {r['avg_bars']:>7.1f}  {exit_str}")
+
+    print(f"\n  Portfolio Avg Sharpe: {np.mean(total_sharpe):.2f}")
+    print(f"  Portfolio Avg PnL:   {np.mean(total_pnl):+.1f}%")
+    print(f"  Profitable Coins:    {sum(1 for p in total_pnl if p > 0)}/{len(COINS)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 100)
+    print("SUPERTREND DEEP PARAMETER SCAN — 9 COIN SHORTLIST")
+    print(f"Coins: {', '.join(c.replace('USDT','') for c in COINS)}")
+    print("=" * 100)
+
+    conn = psycopg2.connect(PG_DSN)
+
+    # Test 1: SL/TP
+    sl_tp_results = test_sl_tp(conn)
+    best_sl_tp = sl_tp_results[0]
+    best_sl = best_sl_tp["sl"]
+    best_tp = best_sl_tp["tp"]
+    print(f"\n>>> Bester SL/TP: {best_sl}/{best_tp} (Sharpe={best_sl_tp['avg_sharpe']:.2f})")
+
+    # Test 2: ST Params (mit bestem SL/TP)
+    st_results = test_st_params(conn, best_sl, best_tp)
+    best_st = st_results[0]
+    best_period = best_st["period"]
+    best_mult = best_st["mult"]
+    print(f"\n>>> Bester ST: ATR({best_period}) × {best_mult} (Sharpe={best_st['avg_sharpe']:.2f})")
+
+    # Test 3: Exit Strategy
+    test_exit_strategy(conn, best_sl, best_tp, best_period, best_mult)
+
+    # Final: Per-Coin Ergebnisse mit optimalen Parametern
+    final_per_coin(conn, best_sl, best_tp, best_period, best_mult)
+
+    conn.close()
+
+    print("\n" + "=" * 100)
+    print("ZUSAMMENFASSUNG")
+    print("=" * 100)
+    print(f"  Optimale Parameter:")
+    print(f"    Supertrend:  ATR({best_period}) × {best_mult}")
+    print(f"    SL/TP:       {best_sl} × ATR / {best_tp} × ATR")
+    print(f"    Filter:      AO({AO_FAST}/{AO_SLOW}) + Funding Rate")
+    print(f"    Coins:       {len(COINS)}")
+    print(f"  vs. Live:")
+    print(f"    Supertrend:  ATR(14) × 2.0")
+    print(f"    SL/TP:       2.0 × ATR / 3.0 × ATR")
+
+
+if __name__ == "__main__":
+    main()

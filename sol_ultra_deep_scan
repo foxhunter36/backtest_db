@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""
+SOL Supertrend — Ultra Deep Parameter Scan
+═══════════════════════════════════════════
+Nur SOLUSDT. Feineres Grid, mehr Variablen.
+
+Tests:
+1. SL/TP Fein-Grid (0.5er Schritte)
+2. Supertrend ATR Period × Multiplier (feines Grid)
+3. AO Fast/Slow Perioden
+4. Funding Rate Thresholds
+5. Volume Filter Threshold (an/aus + verschiedene Levels)
+6. Kombinierter Scan: Top-3 aus jedem Test zusammen
+7. Walk-Forward Validation: Split in Train/Test
+
+Läuft auf Trading Station, DB via Tailscale.
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+from itertools import product
+
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+SYMBOL = "SOLUSDT"
+FEE_PCT = 0.055
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDICATORS
+# ═══════════════════════════════════════════════════════════════════════
+
+def calc_atr(df, period):
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+
+def calc_supertrend(df, period, multiplier):
+    df = df.copy()
+    atr = calc_atr(df, period)
+    df["atr"] = atr
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper = (hl2 + multiplier * atr).values
+    lower = (hl2 - multiplier * atr).values
+    close = df["close"].values
+    n = len(df)
+
+    fu = np.full(n, np.nan)
+    fl = np.full(n, np.nan)
+    d = np.zeros(n, dtype=int)
+
+    s = period
+    if s >= n:
+        df["st_direction"] = 0
+        df["st_long"] = False
+        df["st_short"] = False
+        return df
+
+    fu[s] = upper[s]; fl[s] = lower[s]; d[s] = -1
+
+    for i in range(s + 1, n):
+        fu[i] = upper[i] if (upper[i] < fu[i-1] or close[i-1] > fu[i-1]) else fu[i-1]
+        fl[i] = lower[i] if (lower[i] > fl[i-1] or close[i-1] < fl[i-1]) else fl[i-1]
+        if d[i-1] == 1:
+            if close[i] < fl[i]: d[i] = -1
+            else: d[i] = 1
+        else:
+            if close[i] > fu[i]: d[i] = 1
+            else: d[i] = -1
+
+    df["st_direction"] = d
+    ds = pd.Series(d, index=df.index)
+    df["st_long"] = (ds == 1) & (ds.shift(1) == -1)
+    df["st_short"] = (ds == -1) & (ds.shift(1) == 1)
+    return df
+
+
+def calc_ao(df, fast, slow):
+    df = df.copy()
+    mid = (df["high"] + df["low"]) / 2.0
+    df["ao"] = mid.rolling(fast).mean() - mid.rolling(slow).mean()
+    return df
+
+
+def calc_volume_filter(df, sma_period=20, threshold=1.0):
+    df = df.copy()
+    df["vol_sma"] = df["volume"].rolling(sma_period).mean()
+    df["vol_ok"] = df["volume"] > (df["vol_sma"] * threshold)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+def backtest(df, sl_mult, tp_mult, fr_long_max=0.0001, fr_short_min=-0.0001,
+             use_ao=True, use_fr=True, use_vol=False):
+    trades = []
+    pos = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        c, h, l = row["close"], row["high"], row["low"]
+
+        if pos:
+            if pos["side"] == "long":
+                if l <= pos["sl"]:
+                    trades.append({"pnl": (pos["sl"] - pos["entry"]) / pos["entry"] * 100,
+                                   "exit": "SL", "bars": i - pos["bar"]})
+                    pos = None
+                elif h >= pos["tp"]:
+                    trades.append({"pnl": (pos["tp"] - pos["entry"]) / pos["entry"] * 100,
+                                   "exit": "TP", "bars": i - pos["bar"]})
+                    pos = None
+                elif row["st_short"]:
+                    trades.append({"pnl": (c - pos["entry"]) / pos["entry"] * 100,
+                                   "exit": "FLIP", "bars": i - pos["bar"]})
+                    pos = None
+            else:
+                if h >= pos["sl"]:
+                    trades.append({"pnl": (pos["entry"] - pos["sl"]) / pos["entry"] * 100,
+                                   "exit": "SL", "bars": i - pos["bar"]})
+                    pos = None
+                elif l <= pos["tp"]:
+                    trades.append({"pnl": (pos["entry"] - pos["tp"]) / pos["entry"] * 100,
+                                   "exit": "TP", "bars": i - pos["bar"]})
+                    pos = None
+                elif row["st_long"]:
+                    trades.append({"pnl": (pos["entry"] - c) / pos["entry"] * 100,
+                                   "exit": "FLIP", "bars": i - pos["bar"]})
+                    pos = None
+
+        if pos:
+            continue
+
+        sig = None
+        if row["st_long"]: sig = "long"
+        elif row["st_short"]: sig = "short"
+        if not sig: continue
+
+        # AO filter
+        if use_ao:
+            if sig == "long" and row["ao"] <= 0: continue
+            if sig == "short" and row["ao"] >= 0: continue
+
+        # FR filter
+        if use_fr:
+            fr = row.get("funding_rate", np.nan)
+            if pd.notna(fr):
+                if sig == "long" and fr > fr_long_max: continue
+                if sig == "short" and fr < fr_short_min: continue
+
+        # Volume filter
+        if use_vol:
+            if not row.get("vol_ok", True): continue
+
+        atr = row["atr"]
+        if atr <= 0: continue
+
+        if sig == "long":
+            pos = {"side": "long", "entry": c,
+                   "sl": c - sl_mult * atr, "tp": c + tp_mult * atr, "bar": i}
+        else:
+            pos = {"side": "short", "entry": c,
+                   "sl": c + sl_mult * atr, "tp": c - tp_mult * atr, "bar": i}
+
+    if not trades:
+        return None
+
+    pnls = np.array([t["pnl"] - FEE_PCT * 2 for t in trades])
+    bars = np.array([t["bars"] for t in trades])
+    wins = (pnls > 0).sum()
+    total = len(pnls)
+    cum = np.cumsum(pnls)
+    max_dd = (cum - np.maximum.accumulate(cum)).min()
+    sharpe = pnls.mean() / pnls.std() * np.sqrt(total) if pnls.std() > 0 else 0
+    gp = pnls[pnls > 0].sum()
+    gl = abs(pnls[pnls <= 0].sum())
+    pf = gp / gl if gl > 0 else float("inf")
+
+    exits = {}
+    for t in trades:
+        exits[t["exit"]] = exits.get(t["exit"], 0) + 1
+
+    return {
+        "trades": total, "wins": wins, "winrate": wins / total * 100,
+        "total_pnl": pnls.sum(), "avg_pnl": pnls.mean(),
+        "max_dd": max_dd, "sharpe": sharpe, "pf": pf,
+        "avg_bars": bars.mean(), "exits": exits
+    }
+
+
+def fmt_result(r):
+    if r is None:
+        return "  (keine Trades)"
+    return (f"Trades={r['trades']:>4d} WR={r['winrate']:>4.0f}% PnL={r['total_pnl']:>+7.1f}% "
+            f"Sharpe={r['sharpe']:>5.2f} PF={r['pf']:>5.2f} MaxDD={r['max_dd']:>6.1f}%")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DATA
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_data():
+    conn = psycopg2.connect(PG_DSN)
+    df = pd.read_sql_query(
+        "SELECT timestamp, open, high, low, close, volume FROM kline_1h "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(SYMBOL,))
+
+    fr = pd.read_sql_query(
+        "SELECT timestamp, funding_rate FROM funding_rate "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(SYMBOL,))
+
+    if len(fr) > 0:
+        df = pd.merge_asof(df.sort_values("timestamp"), fr.sort_values("timestamp"),
+                           on="timestamp", direction="backward")
+    else:
+        df["funding_rate"] = np.nan
+
+    conn.close()
+    print(f"SOL 1h Candles: {len(df)} ({len(df)/24:.0f} Tage)")
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 1: SL/TP FEIN-GRID
+# ═══════════════════════════════════════════════════════════════════════
+
+def test1_sl_tp(raw_df):
+    print("\n" + "=" * 90)
+    print("TEST 1: SL/TP FEIN-GRID (ST: ATR14 × 2.0, AO 7/34 + FR)")
+    print("=" * 90)
+
+    df = calc_supertrend(raw_df, period=14, multiplier=2.0)
+    df = calc_ao(df, fast=7, slow=34)
+    df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+    sl_values = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+    tp_values = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0]
+
+    results = []
+    for sl, tp in product(sl_values, tp_values):
+        if tp <= sl: continue
+        r = backtest(df, sl_mult=sl, tp_mult=tp)
+        if r:
+            r["sl"] = sl; r["tp"] = tp; r["rr"] = tp / sl
+            results.append(r)
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'SL':>4s} {'TP':>4s} {'R:R':>5s} | {fmt_result.__doc__ or 'Results'}")
+    print(f"{'SL':>4s} {'TP':>4s} {'R:R':>5s} | {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'MaxDD':>7s} {'AvgBars':>8s}")
+    print("-" * 75)
+    for r in results[:20]:
+        marker = " <-- LIVE" if r["sl"] == 2.0 and r["tp"] == 3.0 else ""
+        marker = " <-- NEW" if r == results[0] else marker
+        print(f"{r['sl']:>4.1f} {r['tp']:>4.1f} {r['rr']:>5.2f} | {r['trades']:>6d} {r['winrate']:>4.0f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['sharpe']:>7.2f} {r['pf']:>5.2f} "
+              f"{r['max_dd']:>6.1f}% {r['avg_bars']:>7.1f}{marker}")
+
+    best = results[0]
+    print(f"\n>>> Best SL/TP: {best['sl']}/{best['tp']} (Sharpe={best['sharpe']:.2f})")
+    return best["sl"], best["tp"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 2: SUPERTREND FEINES GRID
+# ═══════════════════════════════════════════════════════════════════════
+
+def test2_st_params(raw_df, sl, tp):
+    print("\n" + "=" * 90)
+    print(f"TEST 2: SUPERTREND FEINES GRID (SL={sl}, TP={tp}, AO 7/34 + FR)")
+    print("=" * 90)
+
+    atr_periods = [7, 8, 10, 12, 14, 16, 18, 20, 24, 28]
+    st_multipliers = [1.0, 1.2, 1.5, 1.8, 2.0, 2.2, 2.5, 2.8, 3.0, 3.5]
+
+    results = []
+    total = len(atr_periods) * len(st_multipliers)
+    done = 0
+
+    for period, mult in product(atr_periods, st_multipliers):
+        done += 1
+        df = calc_supertrend(raw_df, period=period, multiplier=mult)
+        df = calc_ao(df, fast=7, slow=34)
+        df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+        r = backtest(df, sl_mult=sl, tp_mult=tp)
+        if r:
+            r["period"] = period; r["mult"] = mult
+            results.append(r)
+
+        if done % 20 == 0:
+            print(f"  Progress: {done}/{total}")
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'Per':>4s} {'Mult':>5s} | {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'MaxDD':>7s}")
+    print("-" * 60)
+    for r in results[:20]:
+        marker = " <-- LIVE" if r["period"] == 14 and r["mult"] == 2.0 else ""
+        marker = " <-- NEW" if r == results[0] else marker
+        print(f"{r['period']:>4d} {r['mult']:>5.1f} | {r['trades']:>6d} {r['winrate']:>4.0f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['sharpe']:>7.2f} {r['pf']:>5.2f} "
+              f"{r['max_dd']:>6.1f}%{marker}")
+
+    best = results[0]
+    print(f"\n>>> Best ST: ATR({best['period']}) × {best['mult']} (Sharpe={best['sharpe']:.2f})")
+    return best["period"], best["mult"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 3: AO PERIODEN
+# ═══════════════════════════════════════════════════════════════════════
+
+def test3_ao_params(raw_df, sl, tp, st_period, st_mult):
+    print("\n" + "=" * 90)
+    print(f"TEST 3: AO PERIODEN (ST: ATR{st_period} × {st_mult}, SL={sl}, TP={tp})")
+    print("=" * 90)
+
+    ao_fasts = [3, 5, 7, 9, 12, 15]
+    ao_slows = [20, 26, 30, 34, 40, 50]
+
+    results = []
+    for fast, slow in product(ao_fasts, ao_slows):
+        if fast >= slow: continue
+
+        df = calc_supertrend(raw_df, period=st_period, multiplier=st_mult)
+        df = calc_ao(df, fast=fast, slow=slow)
+        df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+        r = backtest(df, sl_mult=sl, tp_mult=tp)
+        if r:
+            r["ao_fast"] = fast; r["ao_slow"] = slow
+            results.append(r)
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'Fast':>5s} {'Slow':>5s} | {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'MaxDD':>7s}")
+    print("-" * 55)
+    for r in results[:15]:
+        marker = " <-- LIVE" if r["ao_fast"] == 7 and r["ao_slow"] == 34 else ""
+        marker = " <-- NEW" if r == results[0] else marker
+        print(f"{r['ao_fast']:>5d} {r['ao_slow']:>5d} | {r['trades']:>6d} {r['winrate']:>4.0f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['sharpe']:>7.2f} {r['pf']:>5.2f} "
+              f"{r['max_dd']:>6.1f}%{marker}")
+
+    best = results[0]
+    print(f"\n>>> Best AO: {best['ao_fast']}/{best['ao_slow']} (Sharpe={best['sharpe']:.2f})")
+    return best["ao_fast"], best["ao_slow"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 4: FUNDING RATE THRESHOLDS
+# ═══════════════════════════════════════════════════════════════════════
+
+def test4_funding(raw_df, sl, tp, st_period, st_mult, ao_fast, ao_slow):
+    print("\n" + "=" * 90)
+    print(f"TEST 4: FUNDING RATE THRESHOLDS")
+    print("=" * 90)
+
+    fr_thresholds = [0.00005, 0.0001, 0.00015, 0.0002, 0.0003, 0.0005, 0.001, 999]
+    # 999 = FR disabled
+
+    df = calc_supertrend(raw_df, period=st_period, multiplier=st_mult)
+    df = calc_ao(df, fast=ao_fast, slow=ao_slow)
+    df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+    results = []
+    for fr_thresh in fr_thresholds:
+        use_fr = fr_thresh < 100
+        r = backtest(df, sl_mult=sl, tp_mult=tp,
+                     fr_long_max=fr_thresh, fr_short_min=-fr_thresh,
+                     use_fr=use_fr)
+        if r:
+            r["fr_thresh"] = fr_thresh if use_fr else "OFF"
+            results.append(r)
+
+    print(f"\n{'FR Thresh':>12s} | {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'MaxDD':>7s}")
+    print("-" * 60)
+    for r in results:
+        fr_str = "OFF" if r["fr_thresh"] == "OFF" else f"±{r['fr_thresh']:.5f}"
+        marker = " <-- LIVE" if r["fr_thresh"] == 0.0001 else ""
+        marker = " <-- NEW" if r == max(results, key=lambda x: x["sharpe"]) else marker
+        print(f"{fr_str:>12s} | {r['trades']:>6d} {r['winrate']:>4.0f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['sharpe']:>7.2f} {r['pf']:>5.2f} "
+              f"{r['max_dd']:>6.1f}%{marker}")
+
+    best = max(results, key=lambda x: x["sharpe"])
+    use_fr = best["fr_thresh"] != "OFF"
+    fr_val = best["fr_thresh"] if use_fr else 0.0001
+    print(f"\n>>> Best FR: {'±' + str(fr_val) if use_fr else 'OFF'} (Sharpe={best['sharpe']:.2f})")
+    return use_fr, fr_val
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 5: VOLUME FILTER
+# ═══════════════════════════════════════════════════════════════════════
+
+def test5_volume(raw_df, sl, tp, st_period, st_mult, ao_fast, ao_slow, use_fr, fr_val):
+    print("\n" + "=" * 90)
+    print(f"TEST 5: VOLUME FILTER")
+    print("=" * 90)
+
+    vol_configs = [
+        ("OFF", 20, 0.0, False),
+        ("SMA20 × 0.5", 20, 0.5, True),
+        ("SMA20 × 0.8", 20, 0.8, True),
+        ("SMA20 × 1.0", 20, 1.0, True),
+        ("SMA20 × 1.2", 20, 1.2, True),
+        ("SMA20 × 1.5", 20, 1.5, True),
+        ("SMA20 × 2.0", 20, 2.0, True),
+        ("SMA10 × 1.0", 10, 1.0, True),
+        ("SMA30 × 1.0", 30, 1.0, True),
+        ("SMA50 × 1.0", 50, 1.0, True),
+    ]
+
+    results = []
+    for name, sma_per, thresh, use_vol in vol_configs:
+        df = calc_supertrend(raw_df, period=st_period, multiplier=st_mult)
+        df = calc_ao(df, fast=ao_fast, slow=ao_slow)
+        df = calc_volume_filter(df, sma_period=sma_per, threshold=thresh)
+        df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+        r = backtest(df, sl_mult=sl, tp_mult=tp,
+                     fr_long_max=fr_val, fr_short_min=-fr_val,
+                     use_fr=use_fr, use_vol=use_vol)
+        if r:
+            r["vol_config"] = name
+            results.append(r)
+
+    print(f"\n{'Volume':>16s} | {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'MaxDD':>7s}")
+    print("-" * 60)
+    for r in results:
+        marker = " <-- NEW" if r == max(results, key=lambda x: x["sharpe"]) else ""
+        print(f"{r['vol_config']:>16s} | {r['trades']:>6d} {r['winrate']:>4.0f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['sharpe']:>7.2f} {r['pf']:>5.2f} "
+              f"{r['max_dd']:>6.1f}%{marker}")
+
+    best = max(results, key=lambda x: x["sharpe"])
+    print(f"\n>>> Best Volume: {best['vol_config']} (Sharpe={best['sharpe']:.2f})")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 6: WALK-FORWARD VALIDATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def test6_walk_forward(raw_df, sl, tp, st_period, st_mult, ao_fast, ao_slow, use_fr, fr_val):
+    print("\n" + "=" * 90)
+    print("TEST 6: WALK-FORWARD VALIDATION")
+    print("Split: 70% Train / 30% Test")
+    print("=" * 90)
+
+    df = calc_supertrend(raw_df, period=st_period, multiplier=st_mult)
+    df = calc_ao(df, fast=ao_fast, slow=ao_slow)
+    df = df.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+
+    split = int(len(df) * 0.7)
+    train = df.iloc[:split].reset_index(drop=True)
+    test = df.iloc[split:].reset_index(drop=True)
+
+    print(f"  Train: {len(train)} bars ({len(train)/24:.0f} Tage)")
+    print(f"  Test:  {len(test)} bars ({len(test)/24:.0f} Tage)")
+
+    # Optimierte Params auf Train
+    r_train = backtest(train, sl_mult=sl, tp_mult=tp,
+                       fr_long_max=fr_val, fr_short_min=-fr_val, use_fr=use_fr)
+
+    # Gleiche Params auf Test (Out-of-Sample)
+    r_test = backtest(test, sl_mult=sl, tp_mult=tp,
+                      fr_long_max=fr_val, fr_short_min=-fr_val, use_fr=use_fr)
+
+    # Full dataset
+    r_full = backtest(df, sl_mult=sl, tp_mult=tp,
+                      fr_long_max=fr_val, fr_short_min=-fr_val, use_fr=use_fr)
+
+    # Default params auf Test (Vergleich)
+    df_default = calc_supertrend(raw_df, period=14, multiplier=2.0)
+    df_default = calc_ao(df_default, fast=7, slow=34)
+    df_default = df_default.dropna(subset=["atr", "ao"]).reset_index(drop=True)
+    test_default = df_default.iloc[split:].reset_index(drop=True)
+    r_test_default = backtest(test_default, sl_mult=2.0, tp_mult=3.0)
+
+    print(f"\n  {'Dataset':<20s} | {fmt_result(None)}")
+    print(f"  {'Train (70%)':<20s} | {fmt_result(r_train)}")
+    print(f"  {'Test (30%) OPTIM':<20s} | {fmt_result(r_test)}")
+    print(f"  {'Test (30%) DEFAULT':<20s} | {fmt_result(r_test_default)}")
+    print(f"  {'Full Dataset':<20s} | {fmt_result(r_full)}")
+
+    if r_test and r_test_default:
+        degradation = (r_test["sharpe"] - r_train["sharpe"]) / r_train["sharpe"] * 100 if r_train["sharpe"] != 0 else 0
+        improvement = (r_test["sharpe"] - r_test_default["sharpe"]) / abs(r_test_default["sharpe"]) * 100 if r_test_default["sharpe"] != 0 else 0
+        print(f"\n  Train→Test Sharpe Degradation: {degradation:+.1f}%")
+        print(f"  Optimiert vs Default auf Test:  {improvement:+.1f}% Sharpe Verbesserung")
+        if abs(degradation) > 50:
+            print("  ⚠️  WARNUNG: Starke Degradation — mögliches Overfitting!")
+        elif abs(degradation) < 20:
+            print("  ✅ Stabile Performance — Parameter sind robust.")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 90)
+    print("SOL SUPERTREND — ULTRA DEEP PARAMETER SCAN")
+    print("=" * 90)
+
+    raw_df = load_data()
+
+    # Test 1: SL/TP
+    best_sl, best_tp = test1_sl_tp(raw_df)
+
+    # Test 2: ST Params (mit bestem SL/TP)
+    best_period, best_mult = test2_st_params(raw_df, best_sl, best_tp)
+
+    # Test 3: AO Params
+    best_ao_fast, best_ao_slow = test3_ao_params(raw_df, best_sl, best_tp, best_period, best_mult)
+
+    # Test 4: Funding Thresholds
+    use_fr, fr_val = test4_funding(raw_df, best_sl, best_tp, best_period, best_mult,
+                                   best_ao_fast, best_ao_slow)
+
+    # Test 5: Volume
+    test5_volume(raw_df, best_sl, best_tp, best_period, best_mult,
+                 best_ao_fast, best_ao_slow, use_fr, fr_val)
+
+    # Test 6: Walk-Forward Validation
+    test6_walk_forward(raw_df, best_sl, best_tp, best_period, best_mult,
+                       best_ao_fast, best_ao_slow, use_fr, fr_val)
+
+    # === FINAL SUMMARY ===
+    print("\n" + "=" * 90)
+    print("OPTIMALE PARAMETER FÜR SOL SUPERTREND BOT")
+    print("=" * 90)
+    print(f"  Supertrend:    ATR({best_period}) × {best_mult}")
+    print(f"  SL/TP:         {best_sl} × ATR / {best_tp} × ATR")
+    print(f"  AO:            Fast={best_ao_fast} / Slow={best_ao_slow}")
+    print(f"  Funding Rate:  {'±' + str(fr_val) if use_fr else 'OFF'}")
+    print(f"\n  vs. Live:")
+    print(f"  Supertrend:    ATR(14) × 2.0")
+    print(f"  SL/TP:         2.0 × ATR / 3.0 × ATR")
+    print(f"  AO:            Fast=7 / Slow=34")
+    print(f"  Funding Rate:  ±0.0001")
+
+
+if __name__ == "__main__":
+    main()

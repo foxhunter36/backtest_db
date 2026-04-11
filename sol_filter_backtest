@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""
+SOL Supertrend — Filter-Kombinations-Backtest
+══════════════════════════════════════════════
+Testet alle 16 Kombinationen der 4 Bestätigungsfilter (AO, Volume, OI, Funding)
+mit Supertrend als Pflicht-Gate.
+
+Läuft auf Trading Station, DB via Tailscale.
+
+Usage:
+    python sol_filter_backtest.py
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+from itertools import product
+from datetime import datetime
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════════
+
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+SYMBOL = "SOLUSDT"
+
+# Supertrend params (wie live)
+ST_ATR_PERIOD = 14
+ST_MULTIPLIER = 2.0
+
+# AO params
+AO_FAST = 7
+AO_SLOW = 34
+
+# Volume params
+VOL_SMA_PERIOD = 20
+VOL_THRESHOLD = 1.0
+
+# OI params
+OI_LOOKBACK = 3
+
+# Funding params
+FUNDING_LONG_MAX = 0.0001
+FUNDING_SHORT_MIN = -0.0001
+
+# Trade params
+SL_ATR_MULT = 2.0       # Stop Loss = ATR × 2
+TP_ATR_MULT = 3.0       # Take Profit = ATR × 3
+FEE_PCT = 0.055          # 0.055% taker fee (Bybit Perps, ein Weg)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDICATORS (identisch zu indicators.py)
+# ═══════════════════════════════════════════════════════════════════════
+
+def calc_atr(df: pd.DataFrame, period: int = ST_ATR_PERIOD) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+
+def calc_supertrend(df: pd.DataFrame, period: int = ST_ATR_PERIOD,
+                    multiplier: float = ST_MULTIPLIER) -> pd.DataFrame:
+    df = df.copy()
+    atr = calc_atr(df, period)
+    df["atr"] = atr
+
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper_band = hl2 + multiplier * atr
+    lower_band = hl2 - multiplier * atr
+
+    close = df["close"].values
+    upper = upper_band.values
+    lower = lower_band.values
+    n = len(df)
+
+    final_upper = np.full(n, np.nan)
+    final_lower = np.full(n, np.nan)
+    supertrend = np.full(n, np.nan)
+    direction = np.zeros(n, dtype=int)
+
+    start = period
+    if start >= n:
+        df["supertrend"] = np.nan
+        df["st_direction"] = 0
+        df["st_long"] = False
+        df["st_short"] = False
+        return df
+
+    final_upper[start] = upper[start]
+    final_lower[start] = lower[start]
+    supertrend[start] = upper[start]
+    direction[start] = -1
+
+    for i in range(start + 1, n):
+        if upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
+            final_upper[i] = upper[i]
+        else:
+            final_upper[i] = final_upper[i - 1]
+
+        if lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
+            final_lower[i] = lower[i]
+        else:
+            final_lower[i] = final_lower[i - 1]
+
+        if direction[i - 1] == 1:
+            if close[i] < final_lower[i]:
+                direction[i] = -1
+                supertrend[i] = final_upper[i]
+            else:
+                direction[i] = 1
+                supertrend[i] = final_lower[i]
+        else:
+            if close[i] > final_upper[i]:
+                direction[i] = 1
+                supertrend[i] = final_lower[i]
+            else:
+                direction[i] = -1
+                supertrend[i] = final_upper[i]
+
+    df["supertrend"] = supertrend
+    df["st_direction"] = direction
+    dir_series = pd.Series(direction, index=df.index)
+    prev_dir = dir_series.shift(1)
+    df["st_long"] = (dir_series == 1) & (prev_dir == -1)
+    df["st_short"] = (dir_series == -1) & (prev_dir == 1)
+    return df
+
+
+def calc_ao(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    midpoint = (df["high"] + df["low"]) / 2.0
+    df["ao"] = midpoint.rolling(AO_FAST).mean() - midpoint.rolling(AO_SLOW).mean()
+    return df
+
+
+def calc_volume_filter(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["vol_sma"] = df["volume"].rolling(VOL_SMA_PERIOD).mean()
+    df["vol_ok"] = df["volume"] > (df["vol_sma"] * VOL_THRESHOLD)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DATA LOADING
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Lädt Candles, OI, Funding aus der Backtest-DB."""
+    conn = psycopg2.connect(PG_DSN)
+
+    # Candles
+    candles = pd.read_sql_query(
+        "SELECT timestamp, open, high, low, close, volume, turnover "
+        "FROM kline_1h WHERE symbol=%s ORDER BY timestamp",
+        conn, params=(SYMBOL,)
+    )
+    print(f"Candles: {len(candles)} rows ({len(candles)/24:.0f} Tage)")
+
+    # OI
+    oi = pd.read_sql_query(
+        "SELECT timestamp, open_interest FROM open_interest "
+        "WHERE symbol=%s ORDER BY timestamp",
+        conn, params=(SYMBOL,)
+    )
+    print(f"OI:      {len(oi)} rows")
+
+    # Funding
+    funding = pd.read_sql_query(
+        "SELECT timestamp, funding_rate FROM funding_rate "
+        "WHERE symbol=%s ORDER BY timestamp",
+        conn, params=(SYMBOL,)
+    )
+    print(f"Funding: {len(funding)} rows")
+
+    conn.close()
+    return candles, oi, funding
+
+
+def prepare_data(candles: pd.DataFrame, oi: pd.DataFrame,
+                 funding: pd.DataFrame) -> pd.DataFrame:
+    """Berechnet alle Indikatoren und merged OI/Funding."""
+
+    df = calc_supertrend(candles)
+    df = calc_ao(df)
+    df = calc_volume_filter(df)
+
+    # OI: nächsten OI-Wert per asof-merge auf Candle-Timestamp
+    oi_sorted = oi.sort_values("timestamp")
+    df_sorted = df.sort_values("timestamp")
+
+    df = pd.merge_asof(
+        df_sorted, oi_sorted,
+        on="timestamp", direction="backward"
+    )
+
+    # OI Delta: Differenz der letzten OI_LOOKBACK Werte
+    df["oi_delta"] = df["open_interest"].diff(OI_LOOKBACK)
+
+    # Funding: nächsten Wert per asof-merge
+    funding_sorted = funding.sort_values("timestamp")
+    df = pd.merge_asof(
+        df, funding_sorted,
+        on="timestamp", direction="backward"
+    )
+
+    df = df.dropna(subset=["supertrend", "ao", "vol_sma", "atr"]).reset_index(drop=True)
+    print(f"Merged:  {len(df)} rows nach cleanup")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_backtest(df: pd.DataFrame, use_ao: bool, use_vol: bool,
+                 use_oi: bool, use_funding: bool,
+                 min_confirms: int = 0) -> dict:
+    """
+    Simuliert Trades mit gegebener Filter-Konfiguration.
+
+    min_confirms=0: Alle aktiven Filter müssen passen (AND-Logik, wie aktuell live)
+    min_confirms=N: Supertrend ist Gate, dann N von den aktiven Filtern müssen passen
+    """
+
+    trades = []
+    position = None  # {"side": "long"/"short", "entry": float, "sl": float, "tp": float, "bar": int}
+
+    active_filters = []
+    if use_ao: active_filters.append("ao")
+    if use_vol: active_filters.append("vol")
+    if use_oi: active_filters.append("oi")
+    if use_funding: active_filters.append("funding")
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        prev = df.iloc[i - 1]
+        close = row["close"]
+        high = row["high"]
+        low = row["low"]
+
+        # === Position Management ===
+        if position is not None:
+            # Check SL/TP
+            if position["side"] == "long":
+                if low <= position["sl"]:
+                    pnl_pct = (position["sl"] - position["entry"]) / position["entry"] * 100
+                    trades.append({"side": "long", "entry": position["entry"],
+                                   "exit": position["sl"], "pnl_pct": pnl_pct,
+                                   "exit_reason": "SL", "bars_held": i - position["bar"]})
+                    position = None
+                elif high >= position["tp"]:
+                    pnl_pct = (position["tp"] - position["entry"]) / position["entry"] * 100
+                    trades.append({"side": "long", "entry": position["entry"],
+                                   "exit": position["tp"], "pnl_pct": pnl_pct,
+                                   "exit_reason": "TP", "bars_held": i - position["bar"]})
+                    position = None
+                # ST flip → close
+                elif row["st_short"]:
+                    pnl_pct = (close - position["entry"]) / position["entry"] * 100
+                    trades.append({"side": "long", "entry": position["entry"],
+                                   "exit": close, "pnl_pct": pnl_pct,
+                                   "exit_reason": "ST_FLIP", "bars_held": i - position["bar"]})
+                    position = None
+
+            elif position["side"] == "short":
+                if high >= position["sl"]:
+                    pnl_pct = (position["entry"] - position["sl"]) / position["entry"] * 100
+                    trades.append({"side": "short", "entry": position["entry"],
+                                   "exit": position["sl"], "pnl_pct": pnl_pct,
+                                   "exit_reason": "SL", "bars_held": i - position["bar"]})
+                    position = None
+                elif low <= position["tp"]:
+                    pnl_pct = (position["entry"] - position["tp"]) / position["entry"] * 100
+                    trades.append({"side": "short", "entry": position["entry"],
+                                   "exit": position["tp"], "pnl_pct": pnl_pct,
+                                   "exit_reason": "TP", "bars_held": i - position["bar"]})
+                    position = None
+                elif row["st_long"]:
+                    pnl_pct = (position["entry"] - close) / position["entry"] * 100
+                    trades.append({"side": "short", "entry": position["entry"],
+                                   "exit": close, "pnl_pct": pnl_pct,
+                                   "exit_reason": "ST_FLIP", "bars_held": i - position["bar"]})
+                    position = None
+
+        # === Signal Detection (nur wenn flat) ===
+        if position is not None:
+            continue
+
+        signal = None
+        if row["st_long"]:
+            signal = "long"
+        elif row["st_short"]:
+            signal = "short"
+
+        if signal is None:
+            continue
+
+        # === Filter Check ===
+        filter_results = {}
+
+        if use_ao:
+            if signal == "long":
+                filter_results["ao"] = row["ao"] > 0
+            else:
+                filter_results["ao"] = row["ao"] < 0
+
+        if use_vol:
+            filter_results["vol"] = bool(row["vol_ok"])
+
+        if use_oi:
+            if pd.notna(row.get("oi_delta", np.nan)):
+                if signal == "long":
+                    filter_results["oi"] = row["oi_delta"] > 0
+                else:
+                    filter_results["oi"] = row["oi_delta"] < 0
+            else:
+                filter_results["oi"] = True  # kein OI-Daten = durchlassen
+
+        if use_funding:
+            fr = row.get("funding_rate", np.nan)
+            if pd.notna(fr):
+                if signal == "long":
+                    filter_results["funding"] = fr <= FUNDING_LONG_MAX
+                else:
+                    filter_results["funding"] = fr >= FUNDING_SHORT_MIN
+            else:
+                filter_results["funding"] = True  # kein Funding = durchlassen
+
+        # Entscheidung
+        if min_confirms > 0:
+            # N-of-M Logik
+            passed = sum(filter_results.values())
+            if passed < min_confirms:
+                continue
+        else:
+            # AND-Logik: alle müssen passen
+            if not all(filter_results.values()):
+                continue
+
+        # === Entry ===
+        atr = row["atr"]
+        if signal == "long":
+            position = {
+                "side": "long",
+                "entry": close,
+                "sl": close - SL_ATR_MULT * atr,
+                "tp": close + TP_ATR_MULT * atr,
+                "bar": i,
+            }
+        else:
+            position = {
+                "side": "short",
+                "entry": close,
+                "sl": close + SL_ATR_MULT * atr,
+                "tp": close - TP_ATR_MULT * atr,
+                "bar": i,
+            }
+
+    # Close open position at end
+    if position is not None:
+        close = df.iloc[-1]["close"]
+        if position["side"] == "long":
+            pnl_pct = (close - position["entry"]) / position["entry"] * 100
+        else:
+            pnl_pct = (position["entry"] - close) / position["entry"] * 100
+        trades.append({"side": position["side"], "entry": position["entry"],
+                       "exit": close, "pnl_pct": pnl_pct,
+                       "exit_reason": "END", "bars_held": len(df) - position["bar"]})
+
+    return analyze_trades(trades, use_ao, use_vol, use_oi, use_funding, min_confirms)
+
+
+def analyze_trades(trades: list, use_ao: bool, use_vol: bool,
+                   use_oi: bool, use_funding: bool, min_confirms: int) -> dict:
+    """Berechnet Performance-Metriken."""
+
+    if not trades:
+        return {
+            "filters": f"AO={'ON' if use_ao else 'off'} Vol={'ON' if use_vol else 'off'} "
+                       f"OI={'ON' if use_oi else 'off'} FR={'ON' if use_funding else 'off'}",
+            "min_confirms": min_confirms,
+            "trades": 0, "wins": 0, "losses": 0, "winrate": 0,
+            "total_pnl": 0, "avg_pnl": 0, "max_dd": 0,
+            "sharpe": 0, "profit_factor": 0, "avg_bars": 0,
+        }
+
+    df_trades = pd.DataFrame(trades)
+
+    # Fee abziehen (Entry + Exit = 2× Fee)
+    df_trades["pnl_pct"] = df_trades["pnl_pct"] - (FEE_PCT * 2)
+
+    wins = (df_trades["pnl_pct"] > 0).sum()
+    losses = (df_trades["pnl_pct"] <= 0).sum()
+    total = len(df_trades)
+    total_pnl = df_trades["pnl_pct"].sum()
+    avg_pnl = df_trades["pnl_pct"].mean()
+
+    # Max Drawdown (kumulativ)
+    cum = df_trades["pnl_pct"].cumsum()
+    running_max = cum.cummax()
+    drawdown = cum - running_max
+    max_dd = drawdown.min()
+
+    # Sharpe (annualisiert, ~365*24/avg_bars trades pro Jahr)
+    if df_trades["pnl_pct"].std() > 0:
+        sharpe = avg_pnl / df_trades["pnl_pct"].std() * np.sqrt(total)
+    else:
+        sharpe = 0
+
+    # Profit Factor
+    gross_profit = df_trades.loc[df_trades["pnl_pct"] > 0, "pnl_pct"].sum()
+    gross_loss = abs(df_trades.loc[df_trades["pnl_pct"] <= 0, "pnl_pct"].sum())
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    avg_bars = df_trades["bars_held"].mean()
+
+    # Exit Breakdown
+    exit_counts = df_trades["exit_reason"].value_counts().to_dict()
+
+    return {
+        "filters": f"AO={'ON' if use_ao else 'off'} Vol={'ON' if use_vol else 'off'} "
+                   f"OI={'ON' if use_oi else 'off'} FR={'ON' if use_funding else 'off'}",
+        "min_confirms": min_confirms,
+        "trades": total,
+        "wins": wins,
+        "losses": losses,
+        "winrate": wins / total * 100 if total > 0 else 0,
+        "total_pnl": total_pnl,
+        "avg_pnl": avg_pnl,
+        "max_dd": max_dd,
+        "sharpe": sharpe,
+        "profit_factor": profit_factor,
+        "avg_bars": avg_bars,
+        "exits": exit_counts,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 80)
+    print("SOL SUPERTREND — FILTER KOMBINATIONS-BACKTEST")
+    print(f"Symbol: {SYMBOL} | Timeframe: 1h | ST: ATR({ST_ATR_PERIOD}) × {ST_MULTIPLIER}")
+    print(f"SL: {SL_ATR_MULT}×ATR | TP: {TP_ATR_MULT}×ATR | Fee: {FEE_PCT}% per side")
+    print("=" * 80)
+
+    candles, oi, funding = load_data()
+    df = prepare_data(candles, oi, funding)
+
+    results = []
+
+    # ── Teil 1: Alle 16 AND-Kombinationen ──
+    print("\n" + "═" * 80)
+    print("TEIL 1: AND-LOGIK (alle aktiven Filter müssen passen)")
+    print("═" * 80)
+
+    for ao, vol, oi_on, fr in product([True, False], repeat=4):
+        result = run_backtest(df, use_ao=ao, use_vol=vol, use_oi=oi_on,
+                              use_funding=fr, min_confirms=0)
+        result["mode"] = "AND"
+        results.append(result)
+
+    # Sortieren nach Sharpe
+    and_results = sorted([r for r in results if r["mode"] == "AND"],
+                         key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'Filters':<32s} {'Trades':>6s} {'WR%':>6s} {'PnL%':>8s} {'AvgPnL':>7s} "
+          f"{'MaxDD':>7s} {'Sharpe':>7s} {'PF':>6s} {'Bars':>5s}")
+    print("-" * 95)
+
+    for r in and_results:
+        print(f"{r['filters']:<32s} {r['trades']:>6d} {r['winrate']:>5.1f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['avg_pnl']:>+6.2f}% "
+              f"{r['max_dd']:>6.1f}% {r['sharpe']:>7.2f} {r['profit_factor']:>5.2f} "
+              f"{r['avg_bars']:>5.1f}")
+
+    # ── Teil 2: N-of-4 Confirm mit allen 4 Filtern aktiv ──
+    print("\n" + "═" * 80)
+    print("TEIL 2: ST + N/4 CONFIRM (alle 4 Filter aktiv, N müssen passen)")
+    print("═" * 80)
+
+    confirm_results = []
+    for n in range(0, 5):  # 0=keine Confirms nötig (ST only), 1-4
+        result = run_backtest(df, use_ao=True, use_vol=True, use_oi=True,
+                              use_funding=True, min_confirms=n)
+        result["mode"] = f"CONFIRM_{n}/4"
+        confirm_results.append(result)
+
+    print(f"\n{'Mode':<20s} {'Trades':>6s} {'WR%':>6s} {'PnL%':>8s} {'AvgPnL':>7s} "
+          f"{'MaxDD':>7s} {'Sharpe':>7s} {'PF':>6s} {'Bars':>5s}")
+    print("-" * 80)
+
+    for r in confirm_results:
+        print(f"{r['mode']:<20s} {r['trades']:>6d} {r['winrate']:>5.1f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['avg_pnl']:>+6.2f}% "
+              f"{r['max_dd']:>6.1f}% {r['sharpe']:>7.2f} {r['profit_factor']:>5.2f} "
+              f"{r['avg_bars']:>5.1f}")
+
+    # ── Teil 3: Best Overall ──
+    print("\n" + "═" * 80)
+    print("TOP 5 OVERALL (nach Sharpe)")
+    print("═" * 80)
+
+    all_results = sorted(results + confirm_results, key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'Config':<35s} {'Trades':>6s} {'WR%':>6s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'PF':>6s} {'Exits'}")
+    print("-" * 100)
+
+    for r in all_results[:5]:
+        label = f"{r.get('mode', '?')}: {r['filters']}"
+        exits = r.get("exits", {})
+        exit_str = " | ".join(f"{k}:{v}" for k, v in exits.items())
+        print(f"{label:<35s} {r['trades']:>6d} {r['winrate']:>5.1f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['sharpe']:>7.2f} {r['profit_factor']:>5.2f} "
+              f"  {exit_str}")
+
+    # ── Aktuelles Live-Setup zum Vergleich ──
+    print("\n" + "═" * 80)
+    print("AKTUELLES LIVE-SETUP: ST + AO(AND) + Vol(AND) + OI=off + FR=off")
+    print("═" * 80)
+    live = run_backtest(df, use_ao=True, use_vol=True, use_oi=False,
+                        use_funding=False, min_confirms=0)
+    print(f"  Trades: {live['trades']} | WR: {live['winrate']:.1f}% | "
+          f"PnL: {live['total_pnl']:+.1f}% | Sharpe: {live['sharpe']:.2f} | "
+          f"PF: {live['profit_factor']:.2f} | MaxDD: {live['max_dd']:.1f}%")
+    exits = live.get("exits", {})
+    print(f"  Exits: {' | '.join(f'{k}:{v}' for k, v in exits.items())}")
+
+
+if __name__ == "__main__":
+    main()

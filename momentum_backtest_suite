@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""
+MOMENTUM BOT — Comprehensive Backtest Suite
+════════════════════════════════════════════
+Gleiche Struktur wie SOL Supertrend Backtests.
+
+Test 1: Filter-Kombinationen (Volume on/off, verschiedene Thresholds)
+Test 2: BB Parameter Grid (Period × StdDev)
+Test 3: SL/TP vs Trailing Stop Scan
+Test 4: Trail Parameter Grid (Activation × Offset)
+Test 5: Multi-Coin Ranking (welche Coins profitabel)
+Test 6: Walk-Forward Validation
+Test 7: Risk Metrics (Sharpe, Sortino, Calmar, PF)
+
+Läuft auf Trading Station, DB via Tailscale.
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+from itertools import product
+from scipy import stats as sp_stats
+
+PG_DSN = "host=100.96.116.110 port=5432 dbname=bybit_backtest user=collector password=bybit2026"
+
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "TRUMPUSDT", "XRPUSDT", "HYPEUSDT", "RIVERUSDT",
+    "DOGEUSDT", "LYNUSDT", "TAOUSDT", "PIXELUSDT", "SUIUSDT", "CUSDT",
+    "XANUSDT", "MNTUSDT", "1000PEPEUSDT", "ZECUSDT", "ADAUSDT", "FARTCOINUSDT",
+    "AXSUSDT", "BANANAS31USDT", "APRUSDT", "SAHARAUSDT", "DOTUSDT", "LINKUSDT",
+    "LAUSDT", "HBARUSDT", "WIFUSDT", "RENDERUSDT", "RESOLVUSDT", "MYXUSDT",
+    "AVAXUSDT", "AAVEUSDT", "BNBUSDT", "FLOWUSDT", "VIRTUALUSDT", "BCHUSDT",
+    "PIPPINUSDT", "KITEUSDT", "MBOXUSDT", "ENAUSDT", "XPLUSDT", "ICPUSDT",
+    "LTCUSDT", "BERAUSDT", "ASTERUSDT", "TOWNSUSDT", "GALAUSDT", "DEXEUSDT",
+    "CRVUSDT", "XMRUSDT", "VVVUSDT", "BEATUSDT", "PUMPFUNUSDT",
+]
+
+# Defaults (wie live)
+BB_PERIOD = 20
+BB_STD = 2.0
+VOL_CONFIRM_MULT = 1.8
+ATR_PERIOD = 14
+SL_ATR_MULT = 2.5
+TRAIL_ACT = 2.0
+TRAIL_OFF = 2.0
+FEE_PCT = 0.055
+MIN_DAYS = 200
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDICATORS
+# ═══════════════════════════════════════════════════════════════════════
+
+def calc_atr(df, period=ATR_PERIOD):
+    tr = pd.concat([df["high"]-df["low"], (df["high"]-df["close"].shift(1)).abs(),
+                    (df["low"]-df["close"].shift(1)).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+
+
+def calc_bollinger(df, period=BB_PERIOD, std=BB_STD):
+    df = df.copy()
+    df["atr"] = calc_atr(df)
+    df["bb_mid"] = df["close"].rolling(period).mean()
+    bb_std = df["close"].rolling(period).std()
+    df["bb_upper"] = df["bb_mid"] + std * bb_std
+    df["bb_lower"] = df["bb_mid"] - std * bb_std
+    df["vol_sma"] = df["volume"].rolling(period).mean()
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+def backtest_trail(df, bb_period=BB_PERIOD, bb_std=BB_STD, vol_mult=None,
+                   sl_mult=SL_ATR_MULT, trail_act=TRAIL_ACT, trail_off=TRAIL_OFF,
+                   use_fixed_tp=False, tp_mult=3.0, catastrophe_sl=None):
+    """
+    Momentum Bollinger Breakout Backtest.
+    vol_mult=None: kein Volume-Filter
+    vol_mult=1.8: Volume > SMA × 1.8
+    use_fixed_tp=True: fixer TP statt Trail
+    catastrophe_sl: nur als Sicherheitsnetz (kein normaler SL)
+    """
+    df = calc_bollinger(df, period=bb_period, std=bb_std)
+    df = df.dropna(subset=["atr", "bb_upper", "bb_lower", "vol_sma"]).reset_index(drop=True)
+
+    trades = []
+    pos = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        c, h, l = row["close"], row["high"], row["low"]
+
+        if pos:
+            # PnL
+            if pos["side"] == "long":
+                pnl_now = (c - pos["entry"]) / pos["entry"] * 100
+            else:
+                pnl_now = (pos["entry"] - c) / pos["entry"] * 100
+
+            # Trail activation
+            if not use_fixed_tp and not pos.get("trail_active") and pnl_now >= trail_act:
+                off = row["atr"] * trail_off
+                pos["trail_price"] = (c - off) if pos["side"] == "long" else (c + off)
+                pos["trail_active"] = True
+                pos["trail_off_abs"] = off
+
+            # Trail update
+            if pos.get("trail_active"):
+                if pos["side"] == "long":
+                    nt = h - pos["trail_off_abs"]
+                    if nt > pos["trail_price"]: pos["trail_price"] = nt
+                else:
+                    nt = l + pos["trail_off_abs"]
+                    if nt < pos["trail_price"]: pos["trail_price"] = nt
+
+            # Exit checks
+            ex = False
+            if pos["side"] == "long":
+                if sl_mult and l <= pos["sl"]:
+                    trades.append({"pnl": (pos["sl"]-pos["entry"])/pos["entry"]*100, "exit": "SL", "bars": i-pos["bar"]})
+                    ex = True
+                elif catastrophe_sl and not sl_mult and l <= pos.get("cat_sl", 0):
+                    trades.append({"pnl": (pos["cat_sl"]-pos["entry"])/pos["entry"]*100, "exit": "CAT_SL", "bars": i-pos["bar"]})
+                    ex = True
+                elif use_fixed_tp and h >= pos.get("tp", 999999):
+                    trades.append({"pnl": (pos["tp"]-pos["entry"])/pos["entry"]*100, "exit": "TP", "bars": i-pos["bar"]})
+                    ex = True
+                elif pos.get("trail_active") and l <= pos["trail_price"]:
+                    trades.append({"pnl": (pos["trail_price"]-pos["entry"])/pos["entry"]*100, "exit": "TRAIL", "bars": i-pos["bar"]})
+                    ex = True
+                elif c < row["bb_mid"]:  # Exit: price crosses back below BB mid
+                    trades.append({"pnl": (c-pos["entry"])/pos["entry"]*100, "exit": "BB_MID", "bars": i-pos["bar"]})
+                    ex = True
+            else:
+                if sl_mult and h >= pos["sl"]:
+                    trades.append({"pnl": (pos["entry"]-pos["sl"])/pos["entry"]*100, "exit": "SL", "bars": i-pos["bar"]})
+                    ex = True
+                elif catastrophe_sl and not sl_mult and h >= pos.get("cat_sl", 999999):
+                    trades.append({"pnl": (pos["entry"]-pos["cat_sl"])/pos["entry"]*100, "exit": "CAT_SL", "bars": i-pos["bar"]})
+                    ex = True
+                elif use_fixed_tp and l <= pos.get("tp", 0):
+                    trades.append({"pnl": (pos["entry"]-pos["tp"])/pos["entry"]*100, "exit": "TP", "bars": i-pos["bar"]})
+                    ex = True
+                elif pos.get("trail_active") and h >= pos["trail_price"]:
+                    trades.append({"pnl": (pos["entry"]-pos["trail_price"])/pos["entry"]*100, "exit": "TRAIL", "bars": i-pos["bar"]})
+                    ex = True
+                elif c > row["bb_mid"]:
+                    trades.append({"pnl": (pos["entry"]-c)/pos["entry"]*100, "exit": "BB_MID", "bars": i-pos["bar"]})
+                    ex = True
+
+            if ex: pos = None
+            else: continue
+
+        if pos: continue
+
+        # Signal
+        sig = None
+        if c > row["bb_upper"]: sig = "long"
+        elif c < row["bb_lower"]: sig = "short"
+        if not sig: continue
+
+        # Volume filter
+        if vol_mult is not None:
+            if row["volume"] <= row["vol_sma"] * vol_mult:
+                continue
+
+        atr = row["atr"]
+        if atr <= 0: continue
+
+        if sig == "long":
+            pos = {"side": "long", "entry": c, "bar": i, "trail_active": False,
+                   "trail_price": 0, "trail_off_abs": 0}
+            if sl_mult: pos["sl"] = c - sl_mult * atr
+            if catastrophe_sl and not sl_mult: pos["cat_sl"] = c - catastrophe_sl * atr
+            if use_fixed_tp: pos["tp"] = c + tp_mult * atr
+        else:
+            pos = {"side": "short", "entry": c, "bar": i, "trail_active": False,
+                   "trail_price": 0, "trail_off_abs": 0}
+            if sl_mult: pos["sl"] = c + sl_mult * atr
+            if catastrophe_sl and not sl_mult: pos["cat_sl"] = c + catastrophe_sl * atr
+            if use_fixed_tp: pos["tp"] = c - tp_mult * atr
+
+    return analyze(trades)
+
+
+def analyze(trades):
+    if not trades: return None
+    pnls = np.array([t["pnl"] - FEE_PCT*2 for t in trades])
+    bars = np.array([t["bars"] for t in trades])
+    wins = (pnls > 0).sum(); total = len(pnls)
+    cum = np.cumsum(pnls)
+    max_dd = (cum - np.maximum.accumulate(cum)).min() if len(cum) > 0 else 0
+    sharpe = pnls.mean() / pnls.std() * np.sqrt(total) if pnls.std() > 0 else 0
+    gp = pnls[pnls > 0].sum(); gl = abs(pnls[pnls <= 0].sum())
+    pf = gp / gl if gl > 0 else float("inf")
+
+    # Sortino
+    down = pnls[pnls < 0]
+    down_std = np.sqrt(np.mean(down**2)) if len(down) > 0 else 0
+    days_approx = total * 2  # rough estimate
+    tpy = total / (days_approx / 365) if days_approx > 0 else total
+    sortino = pnls.mean() / down_std * np.sqrt(tpy) if down_std > 0 else 0
+
+    # Calmar
+    ann_ret = pnls.sum() / (days_approx / 365) if days_approx > 0 else pnls.sum()
+    calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
+
+    exits = {}
+    for t in trades: exits[t["exit"]] = exits.get(t["exit"], 0) + 1
+
+    return {
+        "trades": total, "wins": wins, "winrate": wins/total*100,
+        "total_pnl": pnls.sum(), "avg_pnl": pnls.mean(), "max_dd": max_dd,
+        "sharpe": sharpe, "sortino": sortino, "calmar": calmar,
+        "pf": pf, "avg_bars": bars.mean(), "exits": exits,
+    }
+
+
+def fmt(r):
+    if not r: return "(keine Trades)"
+    ex = " ".join(f"{k}:{v}" for k,v in sorted(r["exits"].items()))
+    return (f"Tr={r['trades']:>4d} WR={r['winrate']:>4.0f}% PnL={r['total_pnl']:>+7.1f}% "
+            f"Sh={r['sharpe']:>5.2f} So={r['sortino']:>5.2f} Ca={r['calmar']:>5.2f} "
+            f"PF={r['pf']:>5.2f} DD={r['max_dd']:>6.1f}% | {ex}")
+
+
+def load_coin(conn, symbol, table="kline_1h"):
+    df = pd.read_sql_query(
+        f"SELECT timestamp, open, high, low, close, volume FROM {table} "
+        "WHERE symbol=%s ORDER BY timestamp", conn, params=(symbol,))
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 1: VOLUME FILTER
+# ═══════════════════════════════════════════════════════════════════════
+
+def test1_volume(conn):
+    print("\n" + "="*100)
+    print("TEST 1: VOLUME FILTER SCAN (5 beliebteste Coins)")
+    print("="*100)
+
+    test_coins = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT", "SOLUSDT"]
+
+    vol_mults = [None, 0.5, 0.8, 1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0]
+
+    print(f"\n{'Vol Mult':>10s} | {'AvgSharpe':>10s} {'AvgPnL%':>9s} {'AvgTrades':>10s} {'AvgWR':>6s}")
+    print("-"*55)
+
+    for vm in vol_mults:
+        sharpes = []; pnls = []; trade_counts = []; wrs = []
+        for sym in test_coins:
+            df = load_coin(conn, sym)
+            if len(df) < 200: continue
+            r = backtest_trail(df, vol_mult=vm)
+            if r:
+                sharpes.append(r["sharpe"]); pnls.append(r["total_pnl"])
+                trade_counts.append(r["trades"]); wrs.append(r["winrate"])
+        if sharpes:
+            vm_str = f"{vm:.1f}" if vm else "OFF"
+            print(f"{vm_str:>10s} | {np.mean(sharpes):>10.2f} {np.mean(pnls):>+8.1f}% "
+                  f"{np.mean(trade_counts):>9.0f} {np.mean(wrs):>5.0f}%")
+
+    return None  # Best determined visually
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 2: BB PARAMETER GRID
+# ═══════════════════════════════════════════════════════════════════════
+
+def test2_bb_params(conn, best_vol):
+    print("\n" + "="*100)
+    print(f"TEST 2: BOLLINGER BAND PARAMETER GRID (Vol={best_vol})")
+    print("="*100)
+
+    test_coins = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT"]
+    periods = [10, 14, 20, 26, 30, 40]
+    stds = [1.5, 1.8, 2.0, 2.2, 2.5, 3.0]
+
+    results = []
+    total = len(periods) * len(stds)
+    done = 0
+
+    for per, std in product(periods, stds):
+        done += 1
+        sharpes = []; pnls = []
+        for sym in test_coins:
+            df = load_coin(conn, sym)
+            if len(df) < 200: continue
+            r = backtest_trail(df, bb_period=per, bb_std=std, vol_mult=best_vol)
+            if r: sharpes.append(r["sharpe"]); pnls.append(r["total_pnl"])
+        if sharpes:
+            results.append({"period": per, "std": std, "avg_sharpe": np.mean(sharpes),
+                           "avg_pnl": np.mean(pnls)})
+        if done % 10 == 0: print(f"  Progress: {done}/{total}")
+
+    results.sort(key=lambda x: x["avg_sharpe"], reverse=True)
+
+    print(f"\n{'Per':>4s} {'Std':>5s} | {'AvgSharpe':>10s} {'AvgPnL%':>9s}")
+    print("-"*35)
+    for r in results[:15]:
+        marker = " <-- LIVE" if r["period"]==20 and r["std"]==2.0 else ""
+        marker = " <-- BEST" if r == results[0] else marker
+        print(f"{r['period']:>4d} {r['std']:>5.1f} | {r['avg_sharpe']:>10.2f} {r['avg_pnl']:>+8.1f}%{marker}")
+
+    best = results[0]
+    print(f"\n>>> Best BB: Period={best['period']} Std={best['std']} (Sharpe={best['avg_sharpe']:.2f})")
+    return best["period"], best["std"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 3: SL + TRAILING STOP GRID
+# ═══════════════════════════════════════════════════════════════════════
+
+def test3_trail(conn, best_vol, best_bb_per, best_bb_std):
+    print("\n" + "="*100)
+    print(f"TEST 3: SL + TRAILING STOP GRID (BB={best_bb_per}/{best_bb_std}, Vol={best_vol})")
+    print("="*100)
+
+    test_coins = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT"]
+
+    sl_values = [1.5, 2.0, 2.5, 3.0, 4.0]
+    trail_acts = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
+    trail_offs = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+    results = []
+    total = len(sl_values) * len(trail_acts) * len(trail_offs)
+    done = 0
+
+    for sl, ta, to_ in product(sl_values, trail_acts, trail_offs):
+        done += 1
+        sharpes = []; pnls = []
+        for sym in test_coins:
+            df = load_coin(conn, sym)
+            if len(df) < 200: continue
+            r = backtest_trail(df, bb_period=best_bb_per, bb_std=best_bb_std,
+                              vol_mult=best_vol, sl_mult=sl, trail_act=ta, trail_off=to_)
+            if r: sharpes.append(r["sharpe"]); pnls.append(r["total_pnl"])
+        if sharpes:
+            results.append({"sl": sl, "trail_act": ta, "trail_off": to_,
+                           "avg_sharpe": np.mean(sharpes), "avg_pnl": np.mean(pnls)})
+        if done % 50 == 0: print(f"  Progress: {done}/{total}")
+
+    results.sort(key=lambda x: x["avg_sharpe"], reverse=True)
+
+    print(f"\n{'SL':>4s} {'Act%':>5s} {'Off':>4s} | {'AvgSharpe':>10s} {'AvgPnL%':>9s}")
+    print("-"*40)
+    for r in results[:20]:
+        marker = " <-- LIVE" if r["sl"]==2.5 and r["trail_act"]==2.0 and r["trail_off"]==2.0 else ""
+        marker = " <-- BEST" if r == results[0] else marker
+        print(f"{r['sl']:>4.1f} {r['trail_act']:>5.1f} {r['trail_off']:>4.1f} | "
+              f"{r['avg_sharpe']:>10.2f} {r['avg_pnl']:>+8.1f}%{marker}")
+
+    best = results[0]
+    print(f"\n>>> Best Trail: SL={best['sl']} Act={best['trail_act']}% Off={best['trail_off']}x "
+          f"(Sharpe={best['avg_sharpe']:.2f})")
+    return best["sl"], best["trail_act"], best["trail_off"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 4: EXIT STRATEGY COMPARISON
+# ═══════════════════════════════════════════════════════════════════════
+
+def test4_exit_comparison(conn, best_vol, best_bb_per, best_bb_std,
+                          best_sl, best_ta, best_to):
+    print("\n" + "="*100)
+    print("TEST 4: EXIT STRATEGY COMPARISON")
+    print("="*100)
+
+    test_coins = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT"]
+
+    configs = [
+        ("Trail BEST", dict(sl_mult=best_sl, trail_act=best_ta, trail_off=best_to)),
+        ("Trail LIVE (SL2.5/+2%/2.0x)", dict(sl_mult=2.5, trail_act=2.0, trail_off=2.0)),
+        ("Fixed TP 3x", dict(sl_mult=2.5, use_fixed_tp=True, tp_mult=3.0)),
+        ("Fixed TP 4x", dict(sl_mult=2.5, use_fixed_tp=True, tp_mult=4.0)),
+        ("Fixed TP 5x", dict(sl_mult=2.5, use_fixed_tp=True, tp_mult=5.0)),
+        ("Hybrid (kein SL, CatSL 6x)", dict(sl_mult=None, catastrophe_sl=6.0,
+                                              trail_act=best_ta, trail_off=best_to)),
+    ]
+
+    print(f"\n{'Strategy':<35s} | {'AvgSharpe':>10s} {'AvgSortino':>11s} {'AvgCalmar':>10s} "
+          f"{'AvgPF':>6s} {'AvgPnL%':>9s} {'AvgDD':>7s}")
+    print("-"*100)
+
+    for name, kwargs in configs:
+        sharpes=[]; sortinos=[]; calmars=[]; pfs=[]; pnls=[]; dds=[]
+        for sym in test_coins:
+            df = load_coin(conn, sym)
+            if len(df) < 200: continue
+            r = backtest_trail(df, bb_period=best_bb_per, bb_std=best_bb_std,
+                              vol_mult=best_vol, **kwargs)
+            if r:
+                sharpes.append(r["sharpe"]); sortinos.append(r["sortino"])
+                calmars.append(r["calmar"]); pfs.append(r["pf"])
+                pnls.append(r["total_pnl"]); dds.append(r["max_dd"])
+        if sharpes:
+            print(f"{name:<35s} | {np.mean(sharpes):>10.2f} {np.mean(sortinos):>11.2f} "
+                  f"{np.mean(calmars):>10.2f} {np.mean(pfs):>5.2f} {np.mean(pnls):>+8.1f}% "
+                  f"{np.mean(dds):>6.1f}%")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 5: MULTI-COIN RANKING
+# ═══════════════════════════════════════════════════════════════════════
+
+def test5_multicoin(conn, best_vol, best_bb_per, best_bb_std,
+                    best_sl, best_ta, best_to):
+    print("\n" + "="*100)
+    print("TEST 5: MULTI-COIN RANKING (alle 53 Coins)")
+    print(f"BB={best_bb_per}/{best_bb_std} Vol={best_vol} SL={best_sl} Trail={best_ta}%/{best_to}x")
+    print("="*100)
+
+    results = []
+    for idx, sym in enumerate(SYMBOLS, 1):
+        df = load_coin(conn, sym)
+        if len(df) < MIN_DAYS * 24:
+            print(f"  [{idx:>2}/{len(SYMBOLS)}] {sym:<16s} SKIP (nur {len(df)} bars)")
+            continue
+        days = len(df) / 24
+        r = backtest_trail(df, bb_period=best_bb_per, bb_std=best_bb_std,
+                          vol_mult=best_vol, sl_mult=best_sl,
+                          trail_act=best_ta, trail_off=best_to)
+        if r:
+            r["symbol"] = sym; r["days"] = days
+            results.append(r)
+            s = "+" if r["total_pnl"] > 0 else "-"
+            print(f"  [{idx:>2}/{len(SYMBOLS)}] {s} {sym:<16s} Sh={r['sharpe']:>5.2f} "
+                  f"PnL={r['total_pnl']:>+7.1f}% WR={r['winrate']:.0f}% Tr={r['trades']}")
+        else:
+            print(f"  [{idx:>2}/{len(SYMBOLS)}] x {sym:<16s} keine Trades")
+
+    results.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    print(f"\n{'Symbol':<16s} {'Days':>5s} {'Trades':>6s} {'WR%':>5s} {'PnL%':>8s} "
+          f"{'Sharpe':>7s} {'Sortino':>8s} {'Calmar':>7s} {'PF':>6s} {'MaxDD':>7s}")
+    print("-"*95)
+    for r in results:
+        print(f"{r['symbol']:<16s} {r['days']:>5.0f} {r['trades']:>6d} {r['winrate']:>4.0f}% "
+              f"{r['total_pnl']:>+7.1f}% {r['sharpe']:>7.2f} {r['sortino']:>8.2f} "
+              f"{r['calmar']:>7.2f} {r['pf']:>5.2f} {r['max_dd']:>6.1f}%")
+
+    profitable = [r for r in results if r["sharpe"] > 0.3]
+    print(f"\nProfitabel (Sharpe>0.3): {len(profitable)}/{len(results)}")
+    if profitable:
+        print(f"Avg Sharpe: {np.mean([r['sharpe'] for r in profitable]):.2f}")
+        print(f"Avg PnL: {np.mean([r['total_pnl'] for r in profitable]):+.1f}%")
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 6: WALK-FORWARD VALIDATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def test6_walkforward(conn, best_vol, best_bb_per, best_bb_std,
+                      best_sl, best_ta, best_to):
+    print("\n" + "="*100)
+    print("TEST 6: WALK-FORWARD VALIDATION (70/30)")
+    print("="*100)
+
+    test_coins = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT"]
+
+    configs = [
+        ("OPTIMIZED", best_bb_per, best_bb_std, best_vol, best_sl, best_ta, best_to),
+        ("LIVE", 20, 2.0, 1.8, 2.5, 2.0, 2.0),
+    ]
+
+    print(f"\n{'Config':<15s} {'Set':<6s} | {'AvgSharpe':>10s} {'AvgPnL%':>9s} {'AvgWR':>6s} {'AvgDD':>7s}")
+    print("-"*60)
+
+    for name, bb_p, bb_s, vm, sl, ta, to_ in configs:
+        for label in ["Train", "Test"]:
+            sharpes=[]; pnls=[]; wrs=[]; dds=[]
+            for sym in test_coins:
+                df = load_coin(conn, sym)
+                if len(df) < 200: continue
+                split = int(len(df) * 0.7)
+                data = df.iloc[:split] if label == "Train" else df.iloc[split:]
+                data = data.reset_index(drop=True)
+                r = backtest_trail(data, bb_period=bb_p, bb_std=bb_s, vol_mult=vm,
+                                  sl_mult=sl, trail_act=ta, trail_off=to_)
+                if r:
+                    sharpes.append(r["sharpe"]); pnls.append(r["total_pnl"])
+                    wrs.append(r["winrate"]); dds.append(r["max_dd"])
+            if sharpes:
+                print(f"{name:<15s} {label:<6s} | {np.mean(sharpes):>10.2f} {np.mean(pnls):>+8.1f}% "
+                      f"{np.mean(wrs):>5.0f}% {np.mean(dds):>6.1f}%")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 7: DETAILED RISK METRICS (Top Configs)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test7_risk_metrics(conn, best_vol, best_bb_per, best_bb_std,
+                       best_sl, best_ta, best_to):
+    print("\n" + "="*100)
+    print("TEST 7: DETAILED RISK METRICS — OPTIMIZED vs LIVE")
+    print("="*100)
+
+    # Use a larger coin set for robust metrics
+    test_coins = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT",
+                  "LINKUSDT", "DOTUSDT", "HBARUSDT"]
+
+    configs = [
+        ("LIVE (BB20/2.0 Vol1.8 SL2.5 Tr+2%/2x)", 20, 2.0, 1.8, 2.5, 2.0, 2.0),
+        ("OPTIMIZED", best_bb_per, best_bb_std, best_vol, best_sl, best_ta, best_to),
+    ]
+
+    for name, bb_p, bb_s, vm, sl, ta, to_ in configs:
+        all_pnls = []
+        for sym in test_coins:
+            df = load_coin(conn, sym)
+            if len(df) < 200: continue
+            df_calc = calc_bollinger(df, period=bb_p, std=bb_s)
+            df_calc = df_calc.dropna(subset=["atr","bb_upper","bb_lower","vol_sma"]).reset_index(drop=True)
+            r = backtest_trail(df, bb_period=bb_p, bb_std=bb_s, vol_mult=vm,
+                              sl_mult=sl, trail_act=ta, trail_off=to_)
+            if r:
+                # Reconstruct pnls for detailed stats
+                # Re-run to get raw trades
+                pass
+
+        # Aggregate run
+        agg_trades = []
+        for sym in test_coins:
+            df = load_coin(conn, sym)
+            if len(df) < 200: continue
+            r = backtest_trail(df, bb_period=bb_p, bb_std=bb_s, vol_mult=vm,
+                              sl_mult=sl, trail_act=ta, trail_off=to_)
+            if r:
+                all_pnls.extend([r["avg_pnl"]] * r["trades"])  # approximation
+
+        if not all_pnls:
+            print(f"\n  {name}: keine Daten")
+            continue
+
+        # Run once with a large combined dataset for proper metrics
+        combined_sharpes = []; combined_sortinos = []; combined_calmars = []
+        combined_pfs = []; combined_pnls = []; combined_dds = []; combined_wrs = []
+
+        for sym in test_coins:
+            df = load_coin(conn, sym)
+            if len(df) < 200: continue
+            r = backtest_trail(df, bb_period=bb_p, bb_std=bb_s, vol_mult=vm,
+                              sl_mult=sl, trail_act=ta, trail_off=to_)
+            if r:
+                combined_sharpes.append(r["sharpe"])
+                combined_sortinos.append(r["sortino"])
+                combined_calmars.append(r["calmar"])
+                combined_pfs.append(r["pf"])
+                combined_pnls.append(r["total_pnl"])
+                combined_dds.append(r["max_dd"])
+                combined_wrs.append(r["winrate"])
+
+        print(f"\n  {name}:")
+        print(f"    Avg Sharpe:    {np.mean(combined_sharpes):>7.2f}")
+        print(f"    Avg Sortino:   {np.mean(combined_sortinos):>7.2f}")
+        print(f"    Avg Calmar:    {np.mean(combined_calmars):>7.2f}")
+        print(f"    Avg PF:        {np.mean(combined_pfs):>7.2f}")
+        print(f"    Avg PnL:       {np.mean(combined_pnls):>+7.1f}%")
+        print(f"    Avg MaxDD:     {np.mean(combined_dds):>7.1f}%")
+        print(f"    Avg WR:        {np.mean(combined_wrs):>7.1f}%")
+        print(f"    Coins tested:  {len(combined_sharpes)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 100)
+    print("MOMENTUM BOT — COMPREHENSIVE BACKTEST SUITE")
+    print(f"Strategy: Bollinger Breakout | Timeframe: 1h | {len(SYMBOLS)} Coins")
+    print("=" * 100)
+
+    conn = psycopg2.connect(PG_DSN)
+
+    # Verfügbare Daten checken
+    print("\nDaten-Check:")
+    available = 0
+    for sym in SYMBOLS[:5]:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM kline_1h WHERE symbol=%s", (sym,))
+        cnt = cur.fetchone()[0]
+        print(f"  {sym}: {cnt} bars ({cnt/24:.0f} Tage)")
+        if cnt > MIN_DAYS * 24: available += 1
+
+    # Test 1: Volume Filter
+    test1_volume(conn)
+    # Manuell besten Volume-Wert bestimmen (oder None wenn OFF am besten)
+    best_vol = None  # Wird nach Test 1 Output angepasst
+    print("\n>>> Setze best_vol basierend auf Test 1 Output...")
+    # Quick check: OFF vs 1.8 (live)
+    for vm in [None, 1.8]:
+        sh = []
+        for sym in ["BTCUSDT", "ETHUSDT", "XRPUSDT"]:
+            df = load_coin(conn, sym)
+            r = backtest_trail(df, vol_mult=vm)
+            if r: sh.append(r["sharpe"])
+        print(f"    Vol={vm}: avg sharpe={np.mean(sh):.2f}")
+    # Auto-select
+    sh_off = []; sh_live = []
+    for sym in ["BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT"]:
+        df = load_coin(conn, sym)
+        r1 = backtest_trail(df, vol_mult=None)
+        r2 = backtest_trail(df, vol_mult=1.8)
+        if r1: sh_off.append(r1["sharpe"])
+        if r2: sh_live.append(r2["sharpe"])
+    best_vol = None if np.mean(sh_off) > np.mean(sh_live) else 1.8
+    print(f"\n>>> Auto-selected Volume: {best_vol}")
+
+    # Test 2: BB Params
+    best_bb_per, best_bb_std = test2_bb_params(conn, best_vol)
+
+    # Test 3: Trail Grid
+    best_sl, best_ta, best_to = test3_trail(conn, best_vol, best_bb_per, best_bb_std)
+
+    # Test 4: Exit Comparison
+    test4_exit_comparison(conn, best_vol, best_bb_per, best_bb_std,
+                          best_sl, best_ta, best_to)
+
+    # Test 5: Multi-Coin
+    test5_multicoin(conn, best_vol, best_bb_per, best_bb_std,
+                    best_sl, best_ta, best_to)
+
+    # Test 6: Walk-Forward
+    test6_walkforward(conn, best_vol, best_bb_per, best_bb_std,
+                      best_sl, best_ta, best_to)
+
+    # Test 7: Risk Metrics
+    test7_risk_metrics(conn, best_vol, best_bb_per, best_bb_std,
+                       best_sl, best_ta, best_to)
+
+    conn.close()
+
+    # Final Summary
+    print("\n" + "=" * 100)
+    print("ZUSAMMENFASSUNG")
+    print("=" * 100)
+    print(f"  Optimale Parameter:")
+    print(f"    Bollinger:   Period={best_bb_per} Std={best_bb_std}")
+    print(f"    Volume:      {'OFF' if best_vol is None else best_vol}")
+    print(f"    SL:          {best_sl}×ATR")
+    print(f"    Trail:       +{best_ta}% / {best_to}×ATR")
+    print(f"\n  vs. Live:")
+    print(f"    Bollinger:   Period=20 Std=2.0")
+    print(f"    Volume:      1.8")
+    print(f"    SL:          2.5×ATR")
+    print(f"    Trail:       +2.0% / 2.0×ATR")
+
+
+if __name__ == "__main__":
+    main()
